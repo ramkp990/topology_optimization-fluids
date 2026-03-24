@@ -8,15 +8,15 @@ import time
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ---------------------------------------------------------
+ 
 # Customization Parameters
-# ---------------------------------------------------------
+ 
 WALL_THICKNESS = 4
-REMOVAL_FRACTION = 0.4
+REMOVAL_FRACTION = 0.1
 
-# ---------------------------------------------------------
+ 
 # Domain
-# ---------------------------------------------------------
+ 
 Nx = 64
 Ny = 64
 timesteps_no_grad = 2000
@@ -25,89 +25,10 @@ timesteps_grad    = 300
 tau   = 0.6
 omega = 1.0 / tau
 
-'''
-# Inlet: left wall, y=48..53
-inlet_center = Ny // 2 + int(0.3 * Nx)
-inlet_height = int(0.1 * Nx)
-inlet_lo     = inlet_center - inlet_height // 2   # = 48
-inlet_hi     = inlet_center + inlet_height // 2   # = 54 (exclusive)
-inlet_range  = slice(inlet_lo, inlet_hi)
 
-# Outlet: right wall, y=10..15
-outlet_center = Ny // 2 - int(0.3 * Ny)
-outlet_height = int(0.1 * Ny)
-outlet_lo     = outlet_center - outlet_height // 2  # = 10
-outlet_hi     = outlet_center + outlet_height // 2  # = 16 (exclusive)
-outlet_range  = slice(outlet_lo, outlet_hi)
-
-# ---------------------------------------------------------
-# BC interface indices — all at first/last FLUID cell
-# ---------------------------------------------------------
-LEFT_NOSLIP_X  = WALL_THICKNESS            # = 4
-RIGHT_NOSLIP_X = Nx - WALL_THICKNESS - 1   # = 59
-BOT_NOSLIP_Y   = WALL_THICKNESS            # = 4
-TOP_NOSLIP_Y   = Ny - WALL_THICKNESS - 1   # = 59
-
-# Orifice slot edge rows
-INLET_SLOT_BOT_Y  = inlet_lo       # = 48
-INLET_SLOT_TOP_Y  = inlet_hi - 1   # = 53
-OUTLET_SLOT_BOT_Y = outlet_lo      # = 10
-OUTLET_SLOT_TOP_Y = outlet_hi - 1  # = 15
-
-# Interior orifice x columns (not the Zou-He cell)
-inlet_interior_x  = slice(1, WALL_THICKNESS)            # x=1,2,3
-outlet_interior_x = slice(Nx - WALL_THICKNESS, Nx - 1)  # x=60,61,62
-
-# Pressure probes at first/last fluid cell
-P_IN_X  = LEFT_NOSLIP_X   # = 4
-P_OUT_X = RIGHT_NOSLIP_X  # = 59
-
-# ---------------------------------------------------------
-# Solid mask — wall bands with orifices cleared
-# ---------------------------------------------------------
-solid_mask = torch.zeros(Nx, Ny, device=device, dtype=torch.bool)
-solid_mask[0:WALL_THICKNESS, :]  = True
-solid_mask[-WALL_THICKNESS:, :]  = True
-solid_mask[:, 0:WALL_THICKNESS]  = True
-solid_mask[:, -WALL_THICKNESS:]  = True
-solid_mask[0:WALL_THICKNESS,  inlet_range]  = False
-solid_mask[-WALL_THICKNESS:,  outlet_range] = False
-
-# Orifice mask: all cells in the orifice slots (solid_mask=False there)
-orifice_mask = torch.zeros(Nx, Ny, device=device, dtype=torch.bool)
-orifice_mask[0:WALL_THICKNESS,  inlet_range]  = True
-orifice_mask[-WALL_THICKNESS:,  outlet_range] = True
-
-# ---------------------------------------------------------
-# Forced-fluid mask — only the Zou-He BC cells
-# ---------------------------------------------------------
-fluid_mask = torch.zeros(Nx, Ny, device=device, dtype=torch.bool)
-fluid_mask[0,    inlet_range]  = True
-fluid_mask[Nx-1, outlet_range] = True
-
-# ---------------------------------------------------------
-# y-masks for left/right no-slip (skip orifice rows)
-# ---------------------------------------------------------
-left_noslip_ymask = torch.ones(Ny, dtype=torch.bool, device=device)
-left_noslip_ymask[inlet_range] = False
-
-right_noslip_ymask = torch.ones(Ny, dtype=torch.bool, device=device)
-right_noslip_ymask[outlet_range] = False
-
-# ---------------------------------------------------------
-# Adjacency-protection mask for ESO
-# Dilate the full orifice mask (not just the Zou-He cell) so
-# the optimizer never removes a cell immediately adjacent to
-# any part of the orifice slot.
-# ---------------------------------------------------------
-fluid_dilated = F.max_pool2d(
-    orifice_mask.float().unsqueeze(0).unsqueeze(0),
-    kernel_size=3, stride=1, padding=1
-)[0, 0].bool()
-'''
-# ---------------------------------------------------------
+ 
 # LBM D2Q9 setup
-# ---------------------------------------------------------
+ 
 c = torch.tensor(
     [[0,0],[1,0],[0,1],[-1,0],[0,-1],
      [1,1],[-1,1],[-1,-1],[1,-1]],
@@ -124,16 +45,16 @@ w = torch.tensor(
 topology      = torch.nn.Parameter(torch.ones(Nx, Ny, device=device))
 target_volume = 0.2
 
-# ---------------------------------------------------------
+ 
 # Core LBM functions
-# ---------------------------------------------------------
+ 
 def equilibrium(rho, u):
     cu   = torch.einsum("ia,xya->xyi", c_float, u)
     usqr = (u ** 2).sum(-1, keepdim=True)
     return rho.unsqueeze(-1) * w * (1 + 3*cu + 4.5*cu**2 - 1.5*usqr)
 
 
-def streaming(f):
+def streaming1(f):
     parts = []
     for i, ci in enumerate(c):
         parts.append(
@@ -143,10 +64,21 @@ def streaming(f):
         )
     return torch.cat(parts, dim=-1)
 
+def streaming(f):
+    # f: [Nx, Ny, 9]
+    # Roll all 9 directions at once using precomputed shifts
+    f_out = torch.empty_like(f)
+    for i in range(9):
+        f_out[:, :, i] = torch.roll(
+            f[:, :, i],
+            shifts=(c[i, 0].item(), c[i, 1].item()),
+            dims=(0, 1)
+        )
+    return f_out
 
-# ---------------------------------------------------------
+ 
 # [ADD] Function to create masks with variable inlet/outlet Y positions
-# ---------------------------------------------------------
+ 
 def create_masks_for_bc(inlet_y_center, outlet_y_center, 
                         inlet_height=None, outlet_height=None):
     """
@@ -222,9 +154,9 @@ def create_masks_for_bc(inlet_y_center, outlet_y_center,
         'inlet_y_center': inlet_y_center, 'outlet_y_center': outlet_y_center,
     }
 
-# ---------------------------------------------------------
+ 
 # [MODIFY] apply_bcs to accept masks dict
-# ---------------------------------------------------------
+ 
 def apply_bcs(f, u_in, masks):
     f = f.clone()
     
@@ -328,9 +260,9 @@ def write_vtk(iteration, rho, u, density):
     )
 
 
-# ---------------------------------------------------------
+ 
 # [MODIFY] lbm_step to pass masks to apply_bcs
-# ---------------------------------------------------------
+ 
 def lbm_step(f, density_physics, alpha_max, t, masks):
     rho = f.sum(-1).clamp(min=0.5, max=10.0)
     u = torch.einsum("xyi,ia->xya", f, c_float) / rho.unsqueeze(-1)
@@ -348,9 +280,9 @@ def lbm_step(f, density_physics, alpha_max, t, masks):
     return f
 
 
-# ---------------------------------------------------------
+ 
 # [MODIFY] simulate to accept masks + external density + return intermediates
-# ---------------------------------------------------------
+ 
 def simulate(alpha_max, masks, density_input=None):
     f = torch.ones(Nx, Ny, 9, device=device) * w
     
@@ -390,26 +322,12 @@ def simulate(alpha_max, masks, density_input=None):
     
     return mean_pressure_drop, rho, u, density_filtered
 
-# ---------------------------------------------------------
+ 
 # Feasibility Check Function (Phase 1 Criteria)
-# ---------------------------------------------------------
+ 
 def is_feasible(density, pressure_drop, volume_fraction, masks,
                 vol_min=0.10, vol_max=0.40,
                 dp_min=0.01, dp_max=5.0):
-    """
-    Check if a design is physically feasible before saving to dataset.
-    
-    Args:
-        density: Density field [Nx, Ny] (can be on GPU)
-        pressure_drop: Scalar pressure drop value
-        volume_fraction: Fluid volume fraction (0-1)
-        masks: BC masks dictionary from create_masks_for_bc()
-        vol_min, vol_max: Volume fraction bounds
-        dp_min, dp_max: Pressure drop bounds
-    
-    Returns:
-        (is_feasible, reason) tuple
-    """
     
     # Check 1: Volume Fraction Bounds
 
@@ -478,9 +396,9 @@ def check_connectivity(density, masks):
     
     return False  # No path found
 
-# ---------------------------------------------------------
+ 
 # Checkpoint Load/Save Functions
-# ---------------------------------------------------------
+ 
 import json
 
 def load_checkpoint():
@@ -507,9 +425,9 @@ def save_checkpoint(checkpoint):
     print(f"💾 Checkpoint saved: {checkpoint['total_designs']} designs")
 
 
-# ---------------------------------------------------------
+ 
 # Plotting Utility: Save Density as PNG
-# ---------------------------------------------------------
+ 
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend (no display needed)
 import matplotlib.pyplot as plt
@@ -566,14 +484,15 @@ def save_density_plot(density, masks, filepath, title=None):
     plt.savefig(filepath, bbox_inches='tight', dpi=150)
     plt.close(fig)  # Free memory
 
-# ---------------------------------------------------------
+
+ 
 # ESO optimization loop
-# ---------------------------------------------------------
+ 
 alpha_max_constant = 100.0
 
-# ---------------------------------------------------------
+ 
 # [REPLACE] Final ESO loop with dataset generation
-# ---------------------------------------------------------
+ 
 import h5py
 from collections import deque
 
@@ -582,19 +501,19 @@ from collections import deque
 NUM_DESIGNS = 3            # How many valid designs to collect
 VOLUME_THRESHOLD = 0.25        # Save if volume < this
 PRESSURE_THRESHOLD = 2.0       # Save if pressure drop < this
-# ---------------------------------------------------------
+ 
 # Dataset Output Files (3 separate files)
-# ---------------------------------------------------------
+ 
 OUTPUT_FILE_FINAL = "./data/dataset_final.h5"              # Final designs only
 OUTPUT_FILE_INTERMEDIATE = "./data/dataset_intermediate_above.h5"  # Trajectories (inlet > outlet)
 OUTPUT_FILE_ALL = "./data/dataset_all_feasible.h5"         # All feasible designs
 
 
-# ---------------------------------------------------------
+ 
 # Checkpoint Configuration
-# ---------------------------------------------------------
+ 
 CHECKPOINT_FILE = "./data/generation_checkpoint.json"
-BATCH_SIZE = 50  # Designs per run
+BATCH_SIZE = 10  # Designs per run
 TOTAL_DESIGNS_TARGET = 10000  # Overall goal (10 runs = 1000 designs)
 
 
@@ -612,12 +531,12 @@ final_densities, final_pressure_drops, final_volumes, final_bc_info = [], [], []
 intermediate_densities, intermediate_pressure_drops, intermediate_volumes, intermediate_bc_info = [], [], [], []
 all_densities, all_pressure_drops, all_volumes, all_bc_info = [], [], [], []
 
-# ---------------------------------------------------------
+ 
 # Dataset Generation Loop (3-file output)
-# ---------------------------------------------------------
-# ---------------------------------------------------------
+ 
+ 
 # Dataset Generation Loop (with checkpointing)
-# ---------------------------------------------------------
+ 
 import h5py
 from collections import deque
 from datetime import datetime
@@ -649,9 +568,9 @@ while completed_optimizations < BATCH_SIZE and start_design_count + completed_op
     inlet_y = np.random.randint(WALL_THICKNESS + 5, Ny - WALL_THICKNESS - 5)
     outlet_y = np.random.randint(WALL_THICKNESS + 5, Ny - WALL_THICKNESS - 5)
     
-    # ─────────────────────────────────────────────────────
+
     # Skip if this BC config was already used
-    # ─────────────────────────────────────────────────────
+
     bc_key = (int(inlet_y), int(outlet_y))
     if bc_key in used_bc_configs:
         continue  # Try next random config
@@ -750,6 +669,11 @@ while completed_optimizations < BATCH_SIZE and start_design_count + completed_op
                     ]
                     if not guard.all():
                         topology.data[removal] = 0.0
+        else:
+            # Volume reached target AND we have a feasible design
+            # No point continuing — topology won't change anymore
+            if best_density is not None and it >= 10:
+                break 
     
     # FILE 1: Save final design from this optimization run
     if best_density is not None:
@@ -778,9 +702,9 @@ while completed_optimizations < BATCH_SIZE and start_design_count + completed_op
         completed_optimizations += 1
         global_optimization_id += 1
         
-        # ─────────────────────────────────────────────────
+
         # Save checkpoint after each successful design
-        # ─────────────────────────────────────────────────
+
         checkpoint['total_designs'] = start_design_count + completed_optimizations
         checkpoint['used_bc_configs'] = [list(bc) for bc in used_bc_configs]
         checkpoint['run_number'] = run_number
@@ -798,9 +722,9 @@ OUTPUT_FILE_ALL = f"./data/dataset_all_run{run_number}.h5"
 
 
 from datetime import datetime
-# ---------------------------------------------------------
+ 
 # Save All 3 Dataset Files
-# ---------------------------------------------------------
+ 
 def save_dataset_file(filepath, densities, pressure_drops, volumes, bc_info, dataset_type):
     """Generic function to save dataset to HDF5"""
     if len(densities) == 0:
@@ -853,9 +777,9 @@ save_dataset_file(OUTPUT_FILE_INTERMEDIATE, intermediate_densities, intermediate
 save_dataset_file(OUTPUT_FILE_ALL, all_densities, all_pressure_drops, 
                   all_volumes, all_bc_info, "all_feasible_designs")
 
-# ---------------------------------------------------------
+ 
 # Summary
-# ---------------------------------------------------------
+ 
 print("\n" + "=" * 70)
 print("📊 DATASET GENERATION COMPLETE")
 print("=" * 70)
@@ -869,7 +793,368 @@ print("=" * 70)
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 '''
+
+alpha_max_constant = 100.0
+
+ 
+# Dataset Generation - ESO loop with checkpointing
+ 
+import h5py
+import json
+from collections import deque
+from datetime import datetime
+
+ 
+# Configuration
+ 
+CHECKPOINT_FILE = "./data/generation_checkpoint.json"
+
+SAVE_FINAL_ONLY         = True   # File 1: Best design per BC run
+SAVE_INTERMEDIATE_ABOVE = True   # File 2: Trajectories when inlet > outlet
+SAVE_ALL_FEASIBLE       = True   # File 3: Every feasible snapshot past warmup
+
+ALPHA_MAX     = 100.0
+MAX_ESO_ITERS = 50
+
+BATCH_SIZE           = 50     # Max BC configs to process per script run
+TOTAL_DESIGNS_TARGET = 10000  # Overall goal across all runs
+
+ 
+# BC Grid (replaces random sampling)
+ 
+inlet_candidates  = np.linspace(WALL_THICKNESS + 6, Ny - WALL_THICKNESS - 6, 10, dtype=int)
+outlet_candidates = np.linspace(WALL_THICKNESS + 6, Ny - WALL_THICKNESS - 6, 10, dtype=int)
+
+# Only keep BC configs where inlet and outlet are far enough apart
+bc_grid = [(int(i), int(o)) for i in inlet_candidates
+                              for o in outlet_candidates
+           if abs(int(i) - int(o)) >= 8]   # skip degenerate near-same-port configs
+
+print(f"🗺️  BC grid: {len(bc_grid)} valid configs")
+
+ 
+# Load Checkpoint
+ 
+checkpoint         = load_checkpoint()
+used_bc_configs    = set(tuple(bc) for bc in checkpoint['used_bc_configs'])
+start_design_count = checkpoint['total_designs']
+run_number         = checkpoint['run_number'] + 1
+
+print(f"\n🎯 Run #{run_number} | Batch size: {BATCH_SIZE} BC configs | "
+      f"Total goal: {TOTAL_DESIGNS_TARGET}")
+print(f"   Already collected: {start_design_count} designs")
+print(f"   BC configs used so far: {len(used_bc_configs)}")
+print("=" * 70)
+
+ 
+# Storage for this batch
+ 
+final_densities,        final_pressure_drops,        final_volumes,        final_bc_info        = [], [], [], []
+intermediate_densities, intermediate_pressure_drops, intermediate_volumes, intermediate_bc_info = [], [], [], []
+all_densities,          all_pressure_drops,          all_volumes,          all_bc_info          = [], [], [], []
+
+completed_bc_configs    = 0
+completed_optimizations = 0
+global_optimization_id  = checkpoint['total_designs']
+
+ 
+# Main Loop: iterate over BC grid
+ 
+for (inlet_y, outlet_y) in bc_grid:
+
+    # ── Stop conditions ───────────────────────────────────
+    if completed_bc_configs >= BATCH_SIZE:
+        print(f"\n⏹️  Batch limit ({BATCH_SIZE} BC configs) reached. Stopping.")
+        break
+    if start_design_count + completed_optimizations >= TOTAL_DESIGNS_TARGET:
+        print(f"\n⏹️  Total design target ({TOTAL_DESIGNS_TARGET}) reached. Stopping.")
+        break
+
+    # ── Skip already-processed BC configs ────────────────
+    bc_key = (inlet_y, outlet_y)
+    if bc_key in used_bc_configs:
+        continue
+
+    print(f"\n📐 BC config: inlet_y={inlet_y}, outlet_y={outlet_y}")
+
+    # ── Create masks once per BC config ──────────────────
+    masks         = create_masks_for_bc(inlet_y, outlet_y)
+    is_designable = ~masks['solid_mask'] & ~masks['fluid_mask'] & ~masks['orifice_mask']
+
+    # ── Sample one target volume per BC config ────────────
+    target_vol = float(np.random.choice([0.20, 0.25, 0.30]))
+
+    # ── Fresh topology ────────────────────────────────────
+    topology = torch.nn.Parameter(torch.ones(Nx, Ny, device=device))
+
+    best_density   = None
+    best_dp        = float('inf')
+    best_volume    = 1.0
+    best_iteration = 0
+
+    print(f"   🎯 target_vol={target_vol:.2f} ...", end=" ", flush=True)
+
+    # ── ESO iterations ────────────────────────────────────
+    for it in range(MAX_ESO_ITERS):
+
+        if topology.grad is not None:
+            topology.grad.zero_()
+
+        # Forward LBM simulation
+        dp, rho, u, density = simulate(ALPHA_MAX, masks)
+        volume   = topology[is_designable].mean().item()
+        dp_value = dp.item()
+
+        # Backward pass
+        dp.backward()
+
+        # Feasibility check
+        feasible, reason = is_feasible(
+            density, dp_value, volume, masks,
+            vol_min=0.10, vol_max=0.40,
+            dp_min=0.001, dp_max=5.0
+        )
+
+        # Track best feasible design
+        if feasible and dp_value < best_dp:
+            best_density   = density.clone().detach().cpu()
+            best_dp        = dp_value
+            best_volume    = volume
+            best_iteration = it
+
+        # FILE 2: Intermediate snapshots (inlet above outlet only)
+        if SAVE_INTERMEDIATE_ABOVE and inlet_y > outlet_y:
+            if it >= 10 and feasible:
+                intermediate_densities.append(density.clone().detach().cpu())
+                intermediate_pressure_drops.append(dp_value)
+                intermediate_volumes.append(volume)
+                intermediate_bc_info.append({
+                    'inlet_y':            inlet_y,
+                    'outlet_y':           outlet_y,
+                    'height_diff':        inlet_y - outlet_y,
+                    'iteration':          it,
+                    'optimization_id':    global_optimization_id,
+                    'target_volume':      target_vol,
+                    'feasibility_reason': reason,
+                    'is_intermediate':    True
+                })
+
+        # FILE 3: All feasible designs past warmup
+        if SAVE_ALL_FEASIBLE and feasible and it >= 10:
+            all_densities.append(density.clone().detach().cpu())
+            all_pressure_drops.append(dp_value)
+            all_volumes.append(volume)
+            all_bc_info.append({
+                'inlet_y':            inlet_y,
+                'outlet_y':           outlet_y,
+                'height_diff':        inlet_y - outlet_y,
+                'iteration':          it,
+                'optimization_id':    global_optimization_id,
+                'target_volume':      target_vol,
+                'feasibility_reason': reason,
+                'is_intermediate':    (it < MAX_ESO_ITERS - 1)
+            })
+
+        # ── ESO removal step ──────────────────────────────
+        if volume > target_vol:
+            dL_dgamma = topology.grad
+            if dL_dgamma is not None:
+                is_fluid  = (topology > 0.5)
+                eligible  = is_fluid & is_designable & ~masks['fluid_dilated']
+                sens      = dL_dgamma[eligible]
+
+                if sens.numel() > 0:
+                    n_remove = max(int(eligible.sum().item() * REMOVAL_FRACTION), 1)
+                    _, idx   = torch.topk(sens, min(n_remove, sens.numel()), largest=True)
+
+                    flat_eligible = torch.where(eligible.flatten())[0]
+                    removal = torch.zeros_like(topology, dtype=torch.bool)
+                    removal.flatten()[flat_eligible[idx]] = True
+
+                    # Guard: never seal the outlet
+                    guard = removal[
+                        max(0, masks['RIGHT_NOSLIP_X'] - 2):masks['RIGHT_NOSLIP_X'] + 1,
+                        masks['outlet_range']
+                    ]
+                    if not guard.all():
+                        topology.data[removal] = 0.0
+
+    # ── ESO loop finished — now evaluate and save ─────────
+    # (this block is OUTSIDE the for it loop, at BC config level)
+
+    bc_had_any_design = False
+
+    if best_density is not None:
+        vol_gap = abs(best_volume - target_vol)
+
+        if vol_gap > 0.10:
+            # ESO got stuck, never reached target volume
+            print(f"⚠️  Skipped: vol={best_volume:.3f} too far from "
+                  f"target={target_vol:.2f} (gap={vol_gap:.3f})")
+        else:
+            # FILE 1: Save best design from this ESO run
+            final_densities.append(best_density)
+            final_pressure_drops.append(best_dp)
+            final_volumes.append(best_volume)
+            final_bc_info.append({
+                'inlet_y':            inlet_y,
+                'outlet_y':           outlet_y,
+                'height_diff':        inlet_y - outlet_y,
+                'iteration':          best_iteration,
+                'optimization_id':    global_optimization_id,
+                'target_volume':      target_vol,
+                'feasibility_reason': 'Best from ESO run',
+                'is_intermediate':    False
+            })
+
+            # Save plot
+            os.makedirs("./output/plots", exist_ok=True)
+            plot_filename = (
+                f"./output/plots/opt{global_optimization_id:04d}"
+                f"_in{inlet_y}_out{outlet_y}"
+                f"_tvol{target_vol:.2f}"
+                f"_dp{best_dp:.3f}.png"
+            )
+            save_density_plot(
+                best_density, masks, plot_filename,
+                title=(f"Opt #{global_optimization_id} | "
+                       f"Δp={best_dp:.3f} | Vol={best_volume:.2f} | "
+                       f"TargetVol={target_vol:.2f}")
+            )
+
+            bc_had_any_design   = True
+            completed_optimizations += 1
+            global_optimization_id  += 1
+
+            print(f"✅ dp={best_dp:.4f} | vol={best_volume:.3f}")
+    else:
+        print(f"❌ No feasible design found")
+
+    # ── Mark BC config as used and save checkpoint ────────
+    if bc_had_any_design:
+        used_bc_configs.add(bc_key)
+
+    completed_bc_configs += 1
+
+    checkpoint['total_designs']   = start_design_count + completed_optimizations
+    checkpoint['used_bc_configs'] = [list(bc) for bc in used_bc_configs]
+    checkpoint['run_number']      = run_number
+    checkpoint['last_saved']      = datetime.now().isoformat()
+    save_checkpoint(checkpoint)
+
+ 
+# Output filenames
+ 
+OUTPUT_FILE_FINAL        = f"./data/dataset_final_run{run_number}.h5"
+OUTPUT_FILE_INTERMEDIATE = f"./data/dataset_intermediate_run{run_number}.h5"
+OUTPUT_FILE_ALL          = f"./data/dataset_all_run{run_number}.h5"
+
+ 
+# Save All 3 Dataset Files
+ 
+def save_dataset_file(filepath, densities, pressure_drops, volumes, bc_info, dataset_type):
+    """Save a batch of designs to HDF5."""
+    if len(densities) == 0:
+        print(f"⚠️  Skipping {filepath} (no data collected)")
+        return
+
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+    with h5py.File(filepath, 'w') as f:
+        f.create_dataset('density',         data=torch.stack(densities).numpy(), compression='gzip')
+        f.create_dataset('pressure_drop',   data=np.array(pressure_drops))
+        f.create_dataset('volume_fraction', data=np.array(volumes))
+        f.create_dataset('bc_inlet_y',      data=np.array([b['inlet_y']       for b in bc_info]))
+        f.create_dataset('bc_outlet_y',     data=np.array([b['outlet_y']      for b in bc_info]))
+        f.create_dataset('bc_height_diff',  data=np.array([b['height_diff']   for b in bc_info]))
+        f.create_dataset('target_volume',   data=np.array([b['target_volume'] for b in bc_info]))
+        f.create_dataset('eso_iteration',   data=np.array([b['iteration']     for b in bc_info]))
+        f.create_dataset('optimization_id', data=np.array([b['optimization_id'] for b in bc_info]))
+        f.create_dataset('is_intermediate', data=np.array([b['is_intermediate'] for b in bc_info]))
+
+        f.attrs['num_designs']  = len(densities)
+        f.attrs['dataset_type'] = dataset_type
+        f.attrs['nx']           = Nx
+        f.attrs['ny']           = Ny
+        f.attrs['run_number']   = run_number
+        f.attrs['timestamp']    = datetime.now().isoformat()
+
+        metadata_json = [json.dumps(b) for b in bc_info]
+        f.create_dataset('metadata', data=[m.encode('utf-8') for m in metadata_json])
+
+    print(f"✅ Saved: {filepath}")
+    print(f"   Designs:        {len(densities)}")
+    print(f"   Pressure range: [{min(pressure_drops):.4f}, {max(pressure_drops):.4f}]")
+    print(f"   Volume range:   [{min(volumes):.3f}, {max(volumes):.3f}]")
+
+
+save_dataset_file(OUTPUT_FILE_FINAL,
+                  final_densities, final_pressure_drops,
+                  final_volumes, final_bc_info,
+                  "final_designs_only")
+
+save_dataset_file(OUTPUT_FILE_INTERMEDIATE,
+                  intermediate_densities, intermediate_pressure_drops,
+                  intermediate_volumes, intermediate_bc_info,
+                  "intermediate_inlet_above_outlet")
+
+save_dataset_file(OUTPUT_FILE_ALL,
+                  all_densities, all_pressure_drops,
+                  all_volumes, all_bc_info,
+                  "all_feasible_designs")
+
+ 
+# Summary
+ 
+print("\n" + "=" * 70)
+print("📊 DATASET GENERATION COMPLETE")
+print("=" * 70)
+print(f"   Run number:              {run_number}")
+print(f"   BC configs processed:    {completed_bc_configs}")
+print(f"   File 1 (Final only):     {len(final_densities):4d} designs")
+print(f"   File 2 (Intermediates):  {len(intermediate_densities):4d} designs")
+print(f"   File 3 (All feasible):   {len(all_densities):4d} designs")
+print(f"   Total designs so far:    {start_design_count + completed_optimizations}")
+print(f"   Remaining to goal:       {TOTAL_DESIGNS_TARGET - start_design_count - completed_optimizations}")
+print("=" * 70)
+
+
+
 attempts = 0
 while len(densities) < NUM_DESIGNS and attempts < NUM_DESIGNS * 10:
     attempts += 1
