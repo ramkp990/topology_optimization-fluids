@@ -50,6 +50,87 @@ def make_bc_mask(ports, nx=Nx, ny=Ny, wall=WALL):
 
 
 # =========================================================
+# DIFFERENTIABLE CONNECTIVITY LOSS
+# =========================================================
+def make_port_mask(ports, port_type, nx=Nx, ny=Ny, wall=WALL, device='cpu'):
+    """
+    Build a [1, 1, Nx, Ny] binary mask marking the first fluid
+    cells of all ports of the given type.
+    """
+    mask = torch.zeros(1, 1, nx, ny, device=device)
+    for p in ports:
+        if p["type"] != port_type:
+            continue
+        r    = p["range"]
+        wall_side = p["wall"]
+        if wall_side == "left":
+            mask[0, 0, wall, r]          = 1.0
+        elif wall_side == "right":
+            mask[0, 0, nx-wall-1, r]     = 1.0
+        elif wall_side == "bottom":
+            mask[0, 0, r, wall]          = 1.0
+        elif wall_side == "top":
+            mask[0, 0, r, ny-wall-1]     = 1.0
+    return mask
+
+
+
+def path_connectivity_loss(recon, ports_batch, device, n_samples=20):
+    """Smoother connectivity loss using sigmoid-softened path penalty."""
+    B = recon.shape[0]
+    losses = []
+    
+    for i in range(B):
+        ports = ports_batch[i]
+        topo = recon[i, 0]  # [Nx, Ny]
+        
+        inlets = [p for p in ports if p["type"] == "inlet"]
+        outlets = [p for p in ports if p["type"] == "outlet"]
+        if not inlets or not outlets:
+            losses.append(torch.tensor(0.0, device=device))
+            continue
+        
+        path_losses = []
+        for inlet in inlets:
+            for outlet in outlets:
+                # Get port centers (same as before)
+                def get_center(port):
+                    r = port["range"]
+                    c = (r.start + r.stop) / 2.0
+                    if port["wall"] == "left":
+                        return torch.tensor([WALL, c], device=device)
+                    elif port["wall"] == "right":
+                        return torch.tensor([Nx-WALL-1, c], device=device)
+                    elif port["wall"] == "bottom":
+                        return torch.tensor([c, WALL], device=device)
+                    else:
+                        return torch.tensor([c, Ny-WALL-1], device=device)
+                
+                p0 = get_center(inlet)
+                p1 = get_center(outlet)
+                
+                # Sample path points
+                t_vals = torch.linspace(0, 1, n_samples, device=device)
+                xs = (p0[0] + t_vals * (p1[0] - p0[0])).clamp(WALL, Nx-WALL-1).long()
+                ys = (p0[1] + t_vals * (p1[1] - p0[1])).clamp(WALL, Ny-WALL-1).long()
+                
+                path_vals = topo[xs, ys]  # [n_samples]
+                
+                # SOFT penalty: use mean + sigmoid to avoid harsh gradients
+                # Want path_vals.mean() > 0.7 → loss ≈ 0
+                path_mean = path_vals.mean()
+                soft_penalty = torch.sigmoid(10.0 * (0.7 - path_mean))  # Smooth step
+                path_losses.append(soft_penalty)
+        
+        if path_losses:
+            losses.append(torch.stack(path_losses).mean())
+        else:
+            losses.append(torch.tensor(0.0, device=device))
+    
+    return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=device)
+
+
+# =========================================================
 # PORT CELLS HELPER  (needed by check_connectivity)
 # =========================================================
 def port_cells(port):
@@ -142,7 +223,7 @@ class FluidDataset(Dataset):
                 })
             self.ports_list.append(ports)
 
-        # BUG 1 FIX: removed stale self.inlet_y / self.outlet_y print lines
+
         print(f"Loaded {len(self.densities)} designs from {h5_path}")
         print(f"  Pressure: [{self.pressure_drop.min():.4f}, "
               f"{self.pressure_drop.max():.4f}]")
@@ -183,7 +264,7 @@ def make_loaders(h5_path, batch_size=32,
         generator=torch.Generator().manual_seed(seed)
     )
 
-    # BUG 3 FIX: use custom collate_fn so ports_list (with slices) doesn't crash
+
     train_loader = DataLoader(train_ds, batch_size=batch_size,
                               shuffle=True,  drop_last=True,
                               collate_fn=collate_fn)
@@ -260,6 +341,7 @@ class FluidVAE(nn.Module):
         self.enc_conv = nn.Sequential(
             nn.Conv2d(3,   32,  4, stride=2, padding=1),
             nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.1), 
             nn.Conv2d(32,  64,  4, stride=2, padding=1),
             nn.LeakyReLU(0.2),
             nn.Conv2d(64,  128, 4, stride=2, padding=1),
@@ -268,6 +350,7 @@ class FluidVAE(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Flatten()
         )
+
         self.fc_mu     = nn.Linear(conv_flat, latent_dim)
         self.fc_logvar = nn.Linear(conv_flat, latent_dim)
 
@@ -294,6 +377,7 @@ class FluidVAE(nn.Module):
             nn.LeakyReLU(0.2),
             nn.ConvTranspose2d(64,  32,  4, stride=2, padding=1),
             nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.1), 
             nn.ConvTranspose2d(32,  1,   4, stride=2, padding=1),
             nn.Sigmoid()
         )
@@ -327,31 +411,46 @@ def binary_penalty(rho):
     return torch.mean(rho * (1.0 - rho))
 
 
-def vae_loss(recon, target, mu, logvar, beta=1.0, w_bin=2.0):
+# =========================================================
+# UPDATED LOSS
+# =========================================================
+def vae_loss(recon, target, mu, logvar,
+             beta=1.0, w_bin=2.0, w_sharp=1.0,
+             w_conn=0.0,           # start at 0, anneal up
+             ports_batch=None,
+             device='cpu'):
+
     recon_loss = F.binary_cross_entropy(recon, target, reduction='mean')
     kld        = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-    bin_loss   = binary_penalty(recon)
+    bin_loss   = torch.mean(recon * (1.0 - recon))
+    sharp_loss = torch.mean(torch.min(recon, 1.0 - recon))
 
-    # NEW: penalize difference from hard-thresholded version
-    # forces output to commit to 0 or 1
-    recon_hard  = (recon > 0.5).float()
-    sharp_loss  = F.mse_loss(recon, recon_hard.detach())
+    conn_loss = torch.tensor(0.0, device=device)
+    if w_conn > 0.0 and ports_batch is not None:
+        conn_loss = path_connectivity_loss(recon, ports_batch, device)
 
-    total = recon_loss + beta*kld + w_bin*bin_loss + 1.0*sharp_loss
-    return total, recon_loss, kld, bin_loss
+    total = (recon_loss
+             + beta    * kld
+             + w_bin   * bin_loss
+             + w_sharp * sharp_loss
+             + w_conn  * conn_loss)
+
+    return total, recon_loss, kld, bin_loss, conn_loss
 
 
 # =========================================================
 # TRAINING
 # =========================================================
 def train_vae(train_loader, val_loader,
-              epochs=400, lr=1e-3, latent_dim=64,
-              beta=0.1, w_bin=0.5,
+              epochs=400, lr=1e-3, latent_dim=16,
+              beta=0.05, w_bin=5.0, w_sharp=1.0,
+              w_conn_max=2.0,          # final connectivity weight
+              w_conn_warmup=1,
               save_path="vae_best.pth",
               device='cuda'):
 
     model     = FluidVAE(latent_dim=latent_dim).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4 )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, patience=25, factor=0.5, verbose=True
     )
@@ -361,6 +460,7 @@ def train_vae(train_loader, val_loader,
         'train_recon': [], 'val_recon': [],
         'train_kld': [],   'val_kld': [],
         'train_bin': [],   'val_bin': [],
+        'train_conn': [],  
     }
     best_val_loss = float('inf')
 
@@ -369,11 +469,20 @@ def train_vae(train_loader, val_loader,
           f"w_bin={w_bin} | latent={latent_dim}")
     print("=" * 60)
 
+    patience_counter = 0
+    EARLY_STOP_PATIENCE = 20
+
     for epoch in range(epochs):
+
+        if epoch < w_conn_warmup:
+            w_conn = 0.0
+        else:
+            progress = (epoch - w_conn_warmup) / max(1, epochs - w_conn_warmup)
+            w_conn   = w_conn_max * progress
 
         # --- Train ---
         model.train()
-        t_loss = t_recon = t_kld = t_bin = 0.0
+        t_loss = t_recon = t_kld = t_bin = t_conn = 0.0
 
         # BUG 4 FIX: unpack 4 values; use _ for ports (not needed in training)
         for density, bc_mask, _, _ports in train_loader:
@@ -384,8 +493,12 @@ def train_vae(train_loader, val_loader,
             recon, mu, logvar = model(density, bc_mask)
             #WALL_MASK_DEV = make_wall_mask().to(device)
             #recon = recon * (1 - WALL_MASK_DEV) + density * WALL_MASK_DEV
-            loss, rl, kl, bl  = vae_loss(
-                recon, density, mu, logvar, beta=beta, w_bin=w_bin
+            loss, rl, kl, bl, cl = vae_loss(
+                recon, density, mu, logvar,
+                beta=beta, w_bin=w_bin, w_sharp=w_sharp,
+                w_conn=w_conn,
+                ports_batch=_ports,
+                device=device
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -395,31 +508,37 @@ def train_vae(train_loader, val_loader,
             t_recon += rl.item()
             t_kld   += kl.item()
             t_bin   += bl.item()
+            t_conn  += cl.item()
 
         n = len(train_loader)
-        t_loss /= n; t_recon /= n; t_kld /= n; t_bin /= n
+        t_loss /= n; t_recon /= n; t_kld /= n; t_bin /= n; t_conn /= n
 
         # --- Validate ---
         model.eval()
-        v_loss = v_recon = v_kld = v_bin = 0.0
+        v_loss = v_recon = v_kld = v_bin = v_conn = 0.0   # add v_conn
 
         with torch.no_grad():
-            # BUG 4 FIX: unpack 4 values in val loop too
             for density, bc_mask, _, _ports in val_loader:
                 density = density.to(device)
                 bc_mask = bc_mask.to(device)
                 recon, mu, logvar = model(density, bc_mask)
-                loss, rl, kl, bl  = vae_loss(
-                    recon, density, mu, logvar, beta=beta, w_bin=w_bin
+
+                # FIX: unpack 5 values, pass w_conn=0 for val (no connectivity penalty)
+                loss, rl, kl, bl, cl = vae_loss(
+                    recon, density, mu, logvar,
+                    beta=beta, w_bin=w_bin, w_sharp=w_sharp,
+                    w_conn=0.0,          # don't penalize connectivity in val
+                    ports_batch=_ports,
+                    device=device
                 )
                 v_loss  += loss.item()
                 v_recon += rl.item()
                 v_kld   += kl.item()
                 v_bin   += bl.item()
+                v_conn  += cl.item()   # will always be 0 since w_conn=0, but keeps symmetry
 
         n = len(val_loader)
-        v_loss /= n; v_recon /= n; v_kld /= n; v_bin /= n
-
+        v_loss /= n; v_recon /= n; v_kld /= n; v_bin /= n; v_conn /= n
         scheduler.step(v_loss)
 
         history['train_loss'].append(t_loss)
@@ -430,16 +549,29 @@ def train_vae(train_loader, val_loader,
         history['val_kld'].append(v_kld)
         history['train_bin'].append(t_bin)
         history['val_bin'].append(v_bin)
+        history['train_conn'].append(t_conn)  
+
+        # in train_vae, after val loss calculation:
+
 
         if v_loss < best_val_loss:
-            best_val_loss = v_loss
+            best_val_loss  = v_loss
+            best_val_epoch = epoch + 1
+            patience_counter = 0
             torch.save(model.state_dict(), save_path)
+        else:
+            patience_counter += 1
+            if patience_counter >= EARLY_STOP_PATIENCE:
+                print(f"Early stopping at epoch {epoch+1}. Best was epoch {best_val_epoch}")
+                break
 
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"Ep {epoch+1:03d} | "
+            print(f"Ep {epoch+1:03d} | w_conn={w_conn:.2f} | "
                   f"Train: total={t_loss:.4f} recon={t_recon:.4f} "
-                  f"kl={t_kld:.4f} bin={t_bin:.4f} | "
-                  f"Val: total={v_loss:.4f} recon={v_recon:.4f}")
+                  f"kl={t_kld:.4f} bin={t_bin:.4f} conn={t_conn:.4f} | "
+                  f"Val: total={v_loss:.4f}")
+            
+
 
     model.load_state_dict(
         torch.load(save_path, weights_only=True, map_location=device)
@@ -572,15 +704,19 @@ if __name__ == "__main__":
     train_loader, val_loader, test_loader, ds = make_loaders(
         h5_path=H5_PATH,
         batch_size=32,
+        seed=np.random.randint(0, 10000)  # ← Random seed each run
     )
 
     model, history = train_vae(
         train_loader, val_loader,
-        epochs=400,
+        epochs=200,
         lr=1e-3,
-        latent_dim=32,
-        beta=0.1,
-        w_bin=3.0,
+        latent_dim=32,       # restored from 16
+        beta=0.5,            # increased from 0.05
+        w_bin=5.0,
+        w_sharp=1.0,
+        w_conn_max=1.0,      # reduced from 2.0
+        w_conn_warmup=0,    # delayed from 1
         save_path="vae_best_new.pth",
         device=device
     )
