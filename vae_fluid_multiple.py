@@ -248,6 +248,7 @@ class FluidDataset(Dataset):
         return density, bc_mask, metrics, self.ports_list[idx]
 
 
+
 def make_loaders(h5_path, batch_size=32,
                  train_frac=0.7, val_frac=0.15, seed=42):
     torch.manual_seed(seed)
@@ -378,8 +379,8 @@ class FluidVAE(nn.Module):
             nn.ConvTranspose2d(64,  32,  4, stride=2, padding=1),
             nn.LeakyReLU(0.2),
             nn.Dropout2d(0.1), 
-            nn.ConvTranspose2d(32,  1,   4, stride=2, padding=1),
-            nn.Sigmoid()
+            nn.ConvTranspose2d(32,  1,   4, stride=2, padding=1)
+            #nn.Sigmoid()
         )
 
     def encode(self, x, bc_mask):
@@ -410,6 +411,115 @@ class FluidVAE(nn.Module):
 def binary_penalty(rho):
     return torch.mean(rho * (1.0 - rho))
 
+def dice_loss(pred, target, eps=1e-6):
+    pred = torch.sigmoid(pred)
+    num = 2 * (pred * target).sum(dim=(1,2,3))
+    den = (pred + target).sum(dim=(1,2,3)) + eps
+    return 1 - (num / den).mean()
+
+def edge_loss(pred, target):
+    pred = torch.sigmoid(pred)
+
+    sobel_x = torch.tensor([[1,0,-1],[2,0,-2],[1,0,-1]],dtype=torch.float32,device=pred.device).view(1,1,3,3)
+    sobel_y = sobel_x.transpose(2,3)
+
+    def grad(img):
+        gx = F.conv2d(img, sobel_x, padding=1)
+        gy = F.conv2d(img, sobel_y, padding=1)
+        return torch.sqrt(gx**2 + gy**2 + 1e-6)
+
+    return F.l1_loss(grad(pred), grad(target))
+
+def kl_free_bits(mu, logvar, free_bits=0.5):
+    """
+    Prevent KL from collapsing to zero.
+    free_bits is in nats per dimension.
+    """
+    kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+    kl_per_dim = torch.mean(kl_per_dim, dim=0)        # average over batch
+    kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)
+    return kl_per_dim.sum()
+
+
+def soft_flood_connectivity_loss(recon, ports_batch, device,
+                                  n_iters=48, truncate_every=8):
+    """
+    Differentiable connectivity loss via iterative soft flood fill.
+
+    Intuition:
+      - Treat sigmoid(recon) as fluid probability at each cell
+      - Start an "activation" wave at inlet cells
+      - Each step: spread to 4-connected neighbours, gate by fluid probability
+      - After n_iters steps, measure how much activation reached outlet cells
+      - Loss = 1 - outlet_coverage  (0 = perfectly connected, 1 = totally disconnected)
+
+    Why this beats straight-line sampling:
+      - Activation can only travel through fluid cells → respects actual topology
+      - Winding / L-shaped / indirect paths are found naturally
+      - Gradients flow back through every topo multiplication along the path
+      - n_iters ~ grid diagonal (≈90 for 64×64) guarantees any path is found
+
+    Truncated BPTT every `truncate_every` steps prevents gradient explosion
+    over the full unrolled loop while still giving useful signal.
+    """
+    B    = recon.shape[0]
+    prob = torch.sigmoid(recon)          # [B, 1, Nx, Ny]  soft fluid field
+
+    # 4-connected spread kernel (no diagonals — matches BFS convention in codebase)
+    kernel = torch.tensor(
+        [[0., 1., 0.],
+         [1., 0., 1.],
+         [0., 1., 0.]],
+        device=device
+    ).view(1, 1, 3, 3)
+
+    losses = []
+
+    for i in range(B):
+        topo        = prob[i:i+1]            # [1, 1, Nx, Ny]
+        ports       = ports_batch[i]
+        inlets      = [p for p in ports if p["type"] == "inlet"]
+        outlets     = [p for p in ports if p["type"] == "outlet"]
+
+        if not inlets or not outlets:
+            losses.append(torch.tensor(0.0, device=device))
+            continue
+
+        inlet_mask  = make_port_mask(ports, "inlet",  device=device)   # [1,1,Nx,Ny]
+        outlet_mask = make_port_mask(ports, "outlet", device=device)
+
+        # ── seed: inlet cells start fully active ──────────────────────────
+        act = inlet_mask * topo            # differentiable from the start
+
+        for step in range(n_iters):
+
+            # Truncated BPTT: detach every K steps to keep graph manageable.
+            # We still get gradients through the last `truncate_every` steps,
+            # which is enough signal for the decoder weights.
+            if step > 0 and step % truncate_every == 0:
+                act = act.detach()
+
+            # 1. Spread activation to 4-connected neighbours
+            spread = F.conv2d(act, kernel, padding=1)   # [1, 1, Nx, Ny]
+
+            # 2. Gate by fluid probability — THE key differentiable step.
+            #    High topo → spread passes through.
+            #    Low topo  → activation is killed (solid cell).
+            act = (spread * topo).clamp(0.0, 1.0)
+
+            # 3. Re-anchor inlets: they are always active regardless of path
+            act = torch.maximum(act, inlet_mask * topo)
+
+        # ── measure how much activation reached the outlet ────────────────
+        n_outlet_cells = outlet_mask.sum().clamp(min=1.0)
+        reach = (act * outlet_mask).sum() / n_outlet_cells   # in [0, 1]
+
+        # Loss is 0 when outlet fully reached, 1 when completely disconnected.
+        # Soft: even partial reach gives gradient push in the right direction.
+        losses.append(1.0 - reach)
+
+    return torch.stack(losses).mean()
+
 
 # =========================================================
 # UPDATED LOSS
@@ -420,19 +530,29 @@ def vae_loss(recon, target, mu, logvar,
              ports_batch=None,
              device='cpu'):
 
-    recon_loss = F.binary_cross_entropy(recon, target, reduction='mean')
-    kld        = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-    bin_loss   = torch.mean(recon * (1.0 - recon))
-    sharp_loss = torch.mean(torch.min(recon, 1.0 - recon))
+    #recon_loss = F.binary_cross_entropy(recon, target, reduction='mean')
+    bce = F.binary_cross_entropy_with_logits(recon, target)
+    dice = dice_loss(recon, target)
+
+    recon_loss = 0.5*bce + 0.5*dice
+    #kld        = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+    kld = kl_free_bits(mu, logvar, free_bits=0.5)
+
+
+    prob = torch.sigmoid(recon)
+
+    bin_loss   = torch.mean(prob * (1.0 - prob))
+    sharp_loss = torch.mean(torch.min(prob, 1.0 - prob))
 
     conn_loss = torch.tensor(0.0, device=device)
     if w_conn > 0.0 and ports_batch is not None:
-        conn_loss = path_connectivity_loss(recon, ports_batch, device)
-
+        #conn_loss = path_connectivity_loss(recon, ports_batch, device)
+        conn_loss = soft_flood_connectivity_loss(recon, ports_batch, device)
     total = (recon_loss
              + beta    * kld
              + w_bin   * bin_loss
              + w_sharp * sharp_loss
+             + 0.1*edge_loss(recon, target)  # small weight on edge loss to encourage crisp boundaries
              + w_conn  * conn_loss)
 
     return total, recon_loss, kld, bin_loss, conn_loss
@@ -442,8 +562,8 @@ def vae_loss(recon, target, mu, logvar,
 # TRAINING
 # =========================================================
 def train_vae(train_loader, val_loader,
-              epochs=400, lr=1e-3, latent_dim=16,
-              beta=0.05, w_bin=5.0, w_sharp=1.0,
+              epochs=400, lr = 3e-4, latent_dim=16,
+              beta=1.0, w_bin=1.0, w_sharp=1.0,
               w_conn_max=2.0,          # final connectivity weight
               w_conn_warmup=1,
               save_path="vae_best.pth",
@@ -470,9 +590,15 @@ def train_vae(train_loader, val_loader,
     print("=" * 60)
 
     patience_counter = 0
-    EARLY_STOP_PATIENCE = 20
+    EARLY_STOP_PATIENCE = 50
 
     for epoch in range(epochs):
+        # cyclical KL annealing
+        cycle_length = 40          # epochs per cycle
+        beta_max = 1.0
+
+        cycle_pos = epoch % cycle_length
+        beta = min(1.0, cycle_pos / (cycle_length/2)) * beta_max
 
         if epoch < w_conn_warmup:
             w_conn = 0.0
@@ -569,7 +695,7 @@ def train_vae(train_loader, val_loader,
             print(f"Ep {epoch+1:03d} | w_conn={w_conn:.2f} | "
                   f"Train: total={t_loss:.4f} recon={t_recon:.4f} "
                   f"kl={t_kld:.4f} bin={t_bin:.4f} conn={t_conn:.4f} | "
-                  f"Val: total={v_loss:.4f}")
+                  f"Val: total={v_loss:.4f} val: beta={beta:.2f} recon={v_recon:.4f} kl={v_kld:.4f} bin={v_bin:.4f}")
             
 
 
@@ -603,6 +729,7 @@ def evaluate_vae(model, test_loader, device='cuda'):
             recon, _, _ = model(density_dev, bc_mask_dev)
 
             for i in range(len(density)):
+                recon = torch.sigmoid(recon)  # convert logits to probabilities
                 recon_np = recon[i, 0].cpu().numpy()   # [64,64]
                 orig_np  = density[i, 0].cpu().numpy()
                 ports    = ports_batch[i]               # list of port dicts
@@ -710,10 +837,10 @@ if __name__ == "__main__":
     model, history = train_vae(
         train_loader, val_loader,
         epochs=200,
-        lr=1e-3,
+        lr = 3e-4,
         latent_dim=32,       # restored from 16
-        beta=0.5,            # increased from 0.05
-        w_bin=5.0,
+        beta=1.0,            # increased from 0.05
+        w_bin=1.0,
         w_sharp=1.0,
         w_conn_max=1.0,      # reduced from 2.0
         w_conn_warmup=0,    # delayed from 1
