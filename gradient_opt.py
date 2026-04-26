@@ -77,6 +77,48 @@ def bfs(binary, starts):
     return visited
 
 
+
+@torch.no_grad()
+def connectivity_penalty(topo_hard, single_inlet_mask, outlet_mask, 
+                              device, min_width=3):
+    """
+    Returns penalty in [0, 1].
+    Measures how much of the outlet is reachable after progressive erosion.
+    Fully smooth — no binary pass/fail.
+    """
+    erosion_kernel = torch.ones(1, 1, 3, 3, device=device)
+    spread_kernel = torch.tensor(
+        [[0.,1.,0.],[1.,0.,1.],[0.,1.,0.]], device=device
+    ).view(1, 1, 3, 3) / 4.0
+
+    def soft_reach(topo, inlet_mask):
+        """How much of the outlet is reachable via flood fill? → [0, 1]"""
+        act = inlet_mask * topo
+        if act.sum() == 0:
+            return 0.0
+        for _ in range(Nx + Ny):
+            spread = F.conv2d(act, spread_kernel, padding=1)
+            act    = torch.tanh(spread * topo * 3.0)
+            act    = torch.maximum(act, inlet_mask * topo)
+        return (act * outlet_mask).sum() / outlet_mask.sum().clamp(min=1.0)
+
+    penalties = []
+    topo = topo_hard.clone()
+
+    for e in range(1, min_width + 1):
+        # Erode: cell survives only if all neighbors are fluid
+        neighbor_sum = F.conv2d(topo, erosion_kernel, padding=1)
+        topo = (neighbor_sum >= 5).float()
+
+        reach = soft_reach(topo, single_inlet_mask)   # float in [0, 1]
+        # reach=1.0 → fully connected after this erosion → no penalty
+        # reach=0.0 → fully disconnected after this erosion → full penalty
+        weight = e / min_width   # later erosions matter more
+        penalties.append(weight * (1.0 - reach))
+
+    return sum(penalties) / len(penalties)
+
+
 def check_connectivity(density_np, ports):
     binary = (density_np > THRESHOLD).astype(np.uint8)
 
@@ -198,23 +240,11 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
                     n_steps, lr,
                     temp_start, temp_end,
                     lambda_binary,
+                    lambda_conn,
                     intermediate_dir, run_id,
+                    vol_lo=0.15, vol_hi=0.3,
                     save_every=10):
-    """
-    Runs one gradient descent trajectory in latent space.
 
-    Args:
-        z_init:         [1, latent_dim] starting point
-        lambda_volume:  volume penalty weight
-        n_steps:        number of gradient steps
-        lr:             Adam learning rate
-        temp_start/end: sigmoid temperature annealing range
-        lambda_binary:  weight on binary penalty ρ(1-ρ)
-        run_id:         string identifier for this restart
-
-    Returns:
-        dict with best_z, best_dp, best_vol, history
-    """
     device = DEVICE
 
     is_designable = (
@@ -223,98 +253,184 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
         ~masks["orifice_mask"]
     )
 
-    # z is the only optimizable parameter
     z = torch.nn.Parameter(z_init.clone().to(device))
     optimizer = torch.optim.Adam([z], lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=n_steps, eta_min=lr * 0.05
     )
 
-    best_dp   = float('inf')
-    best_z    = z.detach().clone()
-    best_vol  = None
-    history   = []
+    best_dp  = float('inf')
+    best_z   = z.detach().clone()
+    best_vol = None
+    history  = []
+
+    # Latch — never rolls back once True
+    phase_connected = False
 
     for step in range(n_steps):
 
         optimizer.zero_grad()
 
-        # Temperature: 1.0 (smooth) → temp_end (near-binary)
         progress    = step / max(n_steps - 1, 1)
         temperature = temp_start * (temp_end / temp_start) ** progress
 
-        # ── Forward pass: z → density → dp ────────────────────────────
-        logits       = vae.decode(z, bc_mask_tensor)           # [1, 1, 64, 64]
-        soft_density = torch.sigmoid(logits[0, 0] / temperature)  # [64, 64]
+        # ── Forward pass ───────────────────────────────────────────────
+        logits       = vae.decode(z, bc_mask_tensor)
+        soft_density = torch.sigmoid(logits[0, 0] / temperature)
 
-        dp, density_clean = simulate_soft(
-            soft_density, masks, ALPHA_MAX
-        )
+        dp, density_clean = simulate_soft(soft_density, masks, ALPHA_MAX)
+        dp_val  = dp.item()
+        vol     = density_clean[is_designable].mean()
+        vol_val = vol.item()
 
-        dp_val = dp.item()
+        # ── Connectivity penalty (always computed) ─────────────────────
+        conn_penalty = connectivity_penalty(density_clean, masks)
+        #conn_val     = conn_penalty.item()
 
-        # Volume on designable cells only
-        vol = density_clean[is_designable].mean()
+        # Latch forward only
+        if conn_penalty < 0.01:
+            phase_connected = True
 
-        # Binary penalty: 0 when fully binary, 0.25 when all 0.5
+        # ── Volume range penalty (two-sided) ──────────────────────────
+        vol_below         = torch.clamp(vol_lo - vol, min=0.0)
+        vol_above         = torch.clamp(vol - vol_hi, min=0.0)
+        vol_range_penalty = vol_below**2 + vol_above**2
+        vol_in_range      = (vol_val >= vol_lo) and (vol_val <= vol_hi)
+
+        # ── Binary penalty ─────────────────────────────────────────────
         bin_penalty = (density_clean * (1.0 - density_clean)).mean()
 
-        # ── Loss ───────────────────────────────────────────────────────
-        loss = dp + lambda_volume * vol + lambda_binary * bin_penalty
+        # ══════════════════════════════════════════════════════════════
+        # PHASE 1 — not yet connected
+        #   Objective: achieve connectivity as fast as possible.
+        #   - Connectivity loss is the only primary objective.
+        #   - No dp (prevents flood trick).
+        #   - No volume constraint (freedom to increase fluid for path).
+        #   - No binary penalty (don't remove marginal cells mid-search).
+        #   - Mild volume floor: encourage keeping vol >= vol_hi so
+        #     there are enough fluid cells to form a path. Once
+        #     connected we will reduce it in phase 2.
+        # ══════════════════════════════════════════════════════════════
+        #if not phase_connected:
+        if step < n_steps // 3:
+            # Push volume UP toward vol_hi so fluid cells exist to
+            # bridge the gap between inlet and outlet.
+            vol_too_low   = torch.clamp(vol_hi - vol, min=0.0)
+            vol_floor_pen = vol_too_low ** 2
 
-        loss.backward()
-
-        # Clip gradients — latent gradients can spike early
-        torch.nn.utils.clip_grad_norm_([z], max_norm=1.0)
-
-        optimizer.step()
-        scheduler.step()
-
-        # Keep z within the same bounds CMA-ES uses
-        z.data.clamp_(-3.0, 3.0)
-
-        # Track best based on dp alone (not penalized loss)
-        if dp_val < best_dp:
-            best_dp  = dp_val
-            best_z   = z.detach().clone()
-            best_vol = vol.item()
-
-            # Save intermediate plot at improvement
-            with torch.no_grad():
-                design_np = (torch.sigmoid(
-                    vae.decode(best_z, bc_mask_tensor)[0, 0]
-                ) > THRESHOLD).float().cpu().numpy()
-
-            plot_design(
-                design_np, ports, best_dp, best_vol, step,
-                title=f"[{run_id}] Step {step} (best)",
-                save_path=os.path.join(
-                    intermediate_dir,
-                    f"{run_id}_step{step:04d}_dp{best_dp:.4f}.png"
-                )
+            loss = (
+                lambda_conn * conn_penalty
+                + 20.0      * vol_floor_pen
+                + dp
+                # no dp, no binary, no upper volume bound
             )
 
+            phase_str = "PHASE1:connect"
+
+        # ══════════════════════════════════════════════════════════════
+        # PHASE 2 — connected, optimize dp + volume together
+        #   Objectives (simultaneous):
+        #   - Minimize dp (primary physical objective).
+        #   - Keep volume in [vol_lo, vol_hi] (tight band penalty).
+        #   - Maintain connectivity (small coefficient — maintenance only).
+        #   - Ramp binary penalty so output approaches binary.
+        # ══════════════════════════════════════════════════════════════
+        else:
+            w_bin = lambda_binary * progress
+
+            # ── Detect if phase 2 has broken connectivity ──────────────────
+            # conn_val > 0.20 means the flood fill is failing to reach the
+            # outlet — a gradient step in phase 2 removed a critical cell.
+            # Switch to reconnection mode temporarily without resetting latch.
+
+            if conn_penalty > 0.20:
+
+                vol_hi = 0.3
+                # Reconnection mode — same as phase 1 logic but within phase 2.
+                # Strong connectivity drive, no dp, no volume upper bound.
+                # Volume floor: don't let it drop too low while reconnecting.
+                vol_too_low   = torch.clamp(vol_hi - vol, min=0.0)
+                vol_floor_pen = vol_too_low ** 2
+
+                loss = (
+                    lambda_conn * conn_penalty      # strong reconnection
+                    + 20.0      * vol_floor_pen     # add fluid back if needed
+                    + w_bin     * bin_penalty       # keep binary pressure
+                    + dp
+                )
+                phase_str = "PHASE2:reconnect"
+
+            else:
+                print(f"  [{run_id}] Connected at step {step}! Entering phase 2 optimization.")
+                vol_hi = 0.2
+                # Normal phase 2 — connected, optimize dp + volume.
+                loss = (
+                    dp
+                    + lambda_volume * vol_range_penalty
+                    + (lambda_conn * 0.3) * conn_penalty   # slightly stronger maintenance
+                    + w_bin * bin_penalty
+                )
+                phase_str = "PHASE2:dp+vol"
+
+        # ── Gradient step ──────────────────────────────────────────────
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_([z], max_norm=1.0)
+        optimizer.step()
+        scheduler.step()
+        z.data.clamp_(-3.0, 3.0)
+
+        # ── Track best — only in phase 2 with vol in range ────────────
+        #if phase_connected and dp_val < best_dp:# and vol_in_range:
+        best_dp  = dp_val
+        best_z   = z.detach().clone()
+        best_vol = vol_val
+
+        with torch.no_grad():
+            design_np = (torch.sigmoid(
+                vae.decode(best_z, bc_mask_tensor)[0, 0]
+            ) > THRESHOLD).float().cpu().numpy()
+
+        plot_design(
+            design_np, ports, best_dp, best_vol, step,
+            title=f"[{run_id}] Step {step} | Phase2 best",
+            save_path=os.path.join(
+                intermediate_dir,
+                f"{run_id}_step{step:04d}_dp{best_dp:.4f}.png"
+            )
+        )
+
+        # ── Logging ────────────────────────────────────────────────────
+        vol_str = f"{'OK' if vol_in_range else 'OOB'}"
+        print(f"  [{run_id}] step {step:03d} | {phase_str} | "
+              f"T={temperature:.3f} | dp={dp_val:.5f} | "
+              f"vol={vol_val:.3f}({vol_str}) | "
+              f"conn={conn_penalty:.3f} | loss={loss.item():.5f}")
+
         history.append({
-            'step':        step,
-            'dp':          dp_val,
-            'vol':         vol.item(),
-            'bin_penalty': bin_penalty.item(),
-            'loss':        loss.item(),
-            'temperature': temperature,
-            'lr':          scheduler.get_last_lr()[0],
+            'step':         step,
+            'phase':        1 if not phase_connected else 2,
+            'dp':           dp_val,
+            'vol':          vol_val,
+            'conn':         conn_penalty,
+            'vol_in_range': vol_in_range,
+            'loss':         loss.item(),
+            'temperature':  temperature,
         })
 
-        if step % 10 == 0:
-            print(f"  [{run_id}] step {step:03d} | T={temperature:.3f} | "
-                  f"dp={dp_val:.5f} | vol={vol.item():.3f} | "
-                  f"bin={bin_penalty.item():.4f}")
+    # If phase 2 was never reached, return final z with a warning
+    if best_dp == float('inf'):
+        best_z   = z.detach().clone()
+        best_dp  = dp_val
+        best_vol = vol_val
+        print(f"  [{run_id}] WARNING: never connected — returning final z")
 
     return {
-        'best_z':    best_z.squeeze(0).cpu().numpy(),
-        'best_dp':   best_dp,
-        'best_vol':  best_vol,
-        'history':   history,
-        'run_id':    run_id,
+        'best_z':          best_z.squeeze(0).cpu().numpy(),
+        'best_dp':         best_dp,
+        'best_vol':        best_vol,
+        'history':         history,
+        'run_id':          run_id,
+        'phase_reached':   2 if phase_connected else 1,
     }
 
 
@@ -442,12 +558,13 @@ def run_latent_grad(ports,
             masks          = masks,
             ports          = ports,
             z_init         = z_init,
-            lambda_volume  = lambda_volume,
+            lambda_volume  = 50,
             n_steps        = n_steps,
             lr             = lr,
-            temp_start     = temp_start,
+            temp_start     = 1,
             temp_end       = temp_end,
             lambda_binary  = lambda_binary,
+            lambda_conn    = 10.0,  # fixed weight on connectivity penalty
             intermediate_dir = intermediate_dir,
             run_id         = run_id,
         )
