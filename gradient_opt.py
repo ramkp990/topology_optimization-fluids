@@ -78,47 +78,6 @@ def bfs(binary, starts):
 
 
 
-@torch.no_grad()
-def connectivity_penalty(topo_hard, single_inlet_mask, outlet_mask, 
-                              device, min_width=3):
-    """
-    Returns penalty in [0, 1].
-    Measures how much of the outlet is reachable after progressive erosion.
-    Fully smooth — no binary pass/fail.
-    """
-    erosion_kernel = torch.ones(1, 1, 3, 3, device=device)
-    spread_kernel = torch.tensor(
-        [[0.,1.,0.],[1.,0.,1.],[0.,1.,0.]], device=device
-    ).view(1, 1, 3, 3) / 4.0
-
-    def soft_reach(topo, inlet_mask):
-        """How much of the outlet is reachable via flood fill? → [0, 1]"""
-        act = inlet_mask * topo
-        if act.sum() == 0:
-            return 0.0
-        for _ in range(Nx + Ny):
-            spread = F.conv2d(act, spread_kernel, padding=1)
-            act    = torch.tanh(spread * topo * 3.0)
-            act    = torch.maximum(act, inlet_mask * topo)
-        return (act * outlet_mask).sum() / outlet_mask.sum().clamp(min=1.0)
-
-    penalties = []
-    topo = topo_hard.clone()
-
-    for e in range(1, min_width + 1):
-        # Erode: cell survives only if all neighbors are fluid
-        neighbor_sum = F.conv2d(topo, erosion_kernel, padding=1)
-        topo = (neighbor_sum >= 5).float()
-
-        reach = soft_reach(topo, single_inlet_mask)   # float in [0, 1]
-        # reach=1.0 → fully connected after this erosion → no penalty
-        # reach=0.0 → fully disconnected after this erosion → full penalty
-        weight = e / min_width   # later erosions matter more
-        penalties.append(weight * (1.0 - reach))
-
-    return sum(penalties) / len(penalties)
-
-
 def check_connectivity(density_np, ports):
     binary = (density_np > THRESHOLD).astype(np.uint8)
 
@@ -144,6 +103,15 @@ def check_connectivity(density_np, ports):
 
     return True, "OK"
 
+# funtion for checking onnectivity and giving penalty
+
+def connectivity_penalty(density_np, ports):
+    connected, reason = check_connectivity(density_np.detach().cpu().numpy(), ports)
+    if connected:
+        return 0.0
+    else:
+        print(f"  [diag] DISCONNECTED — reason: {reason} — returning penalty=1.0")
+        return 1.0
 
 # =========================================================
 # DIFFERENTIABLE LBM FORWARD PASS
@@ -283,73 +251,49 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
         vol     = density_clean[is_designable].mean()
         vol_val = vol.item()
 
-        # ── Connectivity penalty (always computed) ─────────────────────
-        conn_penalty = connectivity_penalty(density_clean, masks)
-        #conn_val     = conn_penalty.item()
-
-        # Latch forward only
-        if conn_penalty < 0.01:
-            phase_connected = True
-
-        # ── Volume range penalty (two-sided) ──────────────────────────
-        vol_below         = torch.clamp(vol_lo - vol, min=0.0)
-        vol_above         = torch.clamp(vol - vol_hi, min=0.0)
-        vol_range_penalty = vol_below**2 + vol_above**2
-        vol_in_range      = (vol_val >= vol_lo) and (vol_val <= vol_hi)
-
         # ── Binary penalty ─────────────────────────────────────────────
         bin_penalty = (density_clean * (1.0 - density_clean)).mean()
 
-        # ══════════════════════════════════════════════════════════════
-        # PHASE 1 — not yet connected
-        #   Objective: achieve connectivity as fast as possible.
-        #   - Connectivity loss is the only primary objective.
-        #   - No dp (prevents flood trick).
-        #   - No volume constraint (freedom to increase fluid for path).
-        #   - No binary penalty (don't remove marginal cells mid-search).
-        #   - Mild volume floor: encourage keeping vol >= vol_hi so
-        #     there are enough fluid cells to form a path. Once
-        #     connected we will reduce it in phase 2.
-        # ══════════════════════════════════════════════════════════════
-        #if not phase_connected:
         if step < n_steps // 3:
+
+            with torch.no_grad():
+                design_np = (density_clean > THRESHOLD).cpu().numpy()
+            
+            conn_penalty = connectivity_penalty(design_np, ports)
+
+
+            vol_in_range      = (vol_val >= vol_lo) and (vol_val <= vol_hi)
             # Push volume UP toward vol_hi so fluid cells exist to
             # bridge the gap between inlet and outlet.
             vol_too_low   = torch.clamp(vol_hi - vol, min=0.0)
             vol_floor_pen = vol_too_low ** 2
 
             loss = (
-                lambda_conn * conn_penalty
-                + 20.0      * vol_floor_pen
+                20.0      * vol_floor_pen
                 + dp
-                # no dp, no binary, no upper volume bound
             )
 
-            phase_str = "PHASE1:connect"
+            phase_str = "PHASE1:reduce_dp_and_connect"
 
-        # ══════════════════════════════════════════════════════════════
-        # PHASE 2 — connected, optimize dp + volume together
-        #   Objectives (simultaneous):
-        #   - Minimize dp (primary physical objective).
-        #   - Keep volume in [vol_lo, vol_hi] (tight band penalty).
-        #   - Maintain connectivity (small coefficient — maintenance only).
-        #   - Ramp binary penalty so output approaches binary.
-        # ══════════════════════════════════════════════════════════════
+    
         else:
+            with torch.no_grad():
+                design_np = (density_clean > THRESHOLD).cpu().numpy()
+            
+            conn_penalty = connectivity_penalty(design_np, ports)
             w_bin = lambda_binary * progress
 
             # ── Detect if phase 2 has broken connectivity ──────────────────
-            # conn_val > 0.20 means the flood fill is failing to reach the
             # outlet — a gradient step in phase 2 removed a critical cell.
             # Switch to reconnection mode temporarily without resetting latch.
 
-            if conn_penalty > 0.20:
+            if conn_penalty == 1:
+                _vol_hi = 0.3
 
-                vol_hi = 0.3
                 # Reconnection mode — same as phase 1 logic but within phase 2.
                 # Strong connectivity drive, no dp, no volume upper bound.
                 # Volume floor: don't let it drop too low while reconnecting.
-                vol_too_low   = torch.clamp(vol_hi - vol, min=0.0)
+                vol_too_low   = torch.clamp(_vol_hi - vol, min=0.0)
                 vol_floor_pen = vol_too_low ** 2
 
                 loss = (
@@ -361,13 +305,18 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
                 phase_str = "PHASE2:reconnect"
 
             else:
-                print(f"  [{run_id}] Connected at step {step}! Entering phase 2 optimization.")
-                vol_hi = 0.2
+                _vol_hi = 0.2
+                # ── Volume range penalty (two-sided) ──────────────────────────
+                vol_below         = torch.clamp(vol_lo - vol, min=0.0)
+                vol_above         = torch.clamp(vol - _vol_hi, min=0.0)
+                vol_range_penalty = vol_below**2 + vol_above**2
+                vol_in_range      = (vol_val >= vol_lo) and (vol_val <= vol_hi)
+
                 # Normal phase 2 — connected, optimize dp + volume.
                 loss = (
                     dp
                     + lambda_volume * vol_range_penalty
-                    + (lambda_conn * 0.3) * conn_penalty   # slightly stronger maintenance
+                    + lambda_conn * conn_penalty   # slightly stronger maintenance
                     + w_bin * bin_penalty
                 )
                 phase_str = "PHASE2:dp+vol"
@@ -379,25 +328,25 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
         scheduler.step()
         z.data.clamp_(-3.0, 3.0)
 
-        # ── Track best — only in phase 2 with vol in range ────────────
-        #if phase_connected and dp_val < best_dp:# and vol_in_range:
-        best_dp  = dp_val
-        best_z   = z.detach().clone()
-        best_vol = vol_val
+        # save best deisng if connected in phase 2
+        if conn_penalty == 0.0 and phase_str.startswith("PHASE2") and dp_val < best_dp:
+            best_dp  = dp_val
+            best_z   = z.detach().clone()
+            best_vol = vol_val
 
-        with torch.no_grad():
-            design_np = (torch.sigmoid(
-                vae.decode(best_z, bc_mask_tensor)[0, 0]
-            ) > THRESHOLD).float().cpu().numpy()
+            with torch.no_grad():
+                design_np = (torch.sigmoid(
+                    vae.decode(best_z, bc_mask_tensor)[0, 0]
+                ) > THRESHOLD).float().cpu().numpy()
 
-        plot_design(
-            design_np, ports, best_dp, best_vol, step,
-            title=f"[{run_id}] Step {step} | Phase2 best",
-            save_path=os.path.join(
-                intermediate_dir,
-                f"{run_id}_step{step:04d}_dp{best_dp:.4f}.png"
+            plot_design(
+                design_np, ports, best_dp, best_vol, step,
+                title=f"[{run_id}] Step {step} | Phase2 best",
+                save_path=os.path.join(
+                    intermediate_dir,
+                    f"{run_id}_step{step:04d}_dp{best_dp:.4f}.png"
+                )
             )
-        )
 
         # ── Logging ────────────────────────────────────────────────────
         vol_str = f"{'OK' if vol_in_range else 'OOB'}"
