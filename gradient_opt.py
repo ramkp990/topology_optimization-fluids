@@ -1,28 +1,3 @@
-"""
-Latent Gradient Optimizer
-=========================
-Standalone optimizer that finds low-∆p fluid topologies by
-gradient descent directly in the VAE latent space.
-
-Gradient path:
-    z  →  VAE decoder  →  sigmoid(logits/T)  →  LBM  →  ∆p
-    ∂∆p/∂z = ∂∆p/∂ρ · ∂ρ/∂logits · ∂logits/∂z
-
-Usage:
-    python latent_grad_optimizer.py \
-        --port inlet  bottom 32 \
-        --port inlet  right  40 \
-        --port outlet left   32 \
-        --vae_path vae_best_new.pth \
-        --n_restarts 5 \
-        --n_steps 80
-
-Outputs (parallel to cmaes outputs for direct comparison):
-    latgrad_result_<tag>.npz
-    latgrad_<tag>.png
-    latgrad_convergence_<tag>.png
-    latgrad_intermediates/<tag>/step_*.png
-"""
 
 import argparse
 import os
@@ -39,9 +14,7 @@ from vae_fluid_multiple import FluidVAE, make_bc_mask, port_cells
 import new_generate_dataset_multiple as fds
 from new_generate_dataset_multiple import build_bc_masks, sample_ports
 
-# =========================================================
-# CONSTANTS  (mirror cmaes_mit_data_multiple.py)
-# =========================================================
+
 LATENT_DIM = 32
 ALPHA_MAX  = 100.0
 THRESHOLD  = 0.5
@@ -50,9 +23,6 @@ WALL       = 4
 DEVICE     = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
-# =========================================================
-# PORT HELPERS  (identical to CMA-ES script)
-# =========================================================
 def ports_to_desc(ports):
     return " | ".join(f"{p['type']}@{p['wall']}:{p['center']}" for p in ports)
 
@@ -60,9 +30,9 @@ def ports_to_tag(ports):
     return "_".join(f"{p['type'][0]}{p['wall'][0]}{p['center']}" for p in ports)
 
 
-# =========================================================
-# CONNECTIVITY CHECK  (bidirectional, identical to CMA-ES)
-# =========================================================
+
+# CONNECTIVITY CHECK  
+
 def bfs(binary, starts):
     visited = set(map(tuple, starts))
     queue   = deque(starts)
@@ -106,16 +76,16 @@ def check_connectivity(density_np, ports):
 # funtion for checking onnectivity and giving penalty
 
 def connectivity_penalty(density_np, ports):
-    connected, reason = check_connectivity(density_np.detach().cpu().numpy(), ports)
+    connected, reason = check_connectivity(density_np, ports)
     if connected:
         return 0.0
     else:
         print(f"  [diag] DISCONNECTED — reason: {reason} — returning penalty=1.0")
         return 1.0
 
-# =========================================================
-# DIFFERENTIABLE LBM FORWARD PASS
-# =========================================================
+
+# DIFFERENTIABLE LBM FORWARD PASS for soft density to keep gradients
+
 def simulate_soft(soft_density, masks, alpha_max,
                   timesteps_warmup=2000, timesteps_grad=300):
     device = soft_density.device
@@ -170,9 +140,8 @@ def simulate_soft(soft_density, masks, alpha_max,
     return dp, density_clean
 
 
-# =========================================================
-# PLOT HELPER  (mirrors CMA-ES plot_design)
-# =========================================================
+# plot 
+
 def plot_design(design_np, ports, dp, vol, step,
                 title, save_path, extra_info=""):
     fig, ax = plt.subplots(figsize=(5, 5))
@@ -200,9 +169,8 @@ def plot_design(design_np, ports, dp, vol, step,
     plt.close()
 
 
-# =========================================================
-# SINGLE-TRAJECTORY GRADIENT OPTIMIZER
-# =========================================================
+# grad optimization step for single restart
+
 def optimize_single(vae, bc_mask_tensor, masks, ports,
                     z_init, lambda_volume,
                     n_steps, lr,
@@ -242,7 +210,7 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
         progress    = step / max(n_steps - 1, 1)
         temperature = temp_start * (temp_end / temp_start) ** progress
 
-        # ── Forward pass ───────────────────────────────────────────────
+        # Forward pass
         logits       = vae.decode(z, bc_mask_tensor)
         soft_density = torch.sigmoid(logits[0, 0] / temperature)
 
@@ -251,7 +219,7 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
         vol     = density_clean[is_designable].mean()
         vol_val = vol.item()
 
-        # ── Binary penalty ─────────────────────────────────────────────
+        # Binary penalty
         bin_penalty = (density_clean * (1.0 - density_clean)).mean()
 
         if step < n_steps // 3:
@@ -283,7 +251,7 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
             conn_penalty = connectivity_penalty(design_np, ports)
             w_bin = lambda_binary * progress
 
-            # ── Detect if phase 2 has broken connectivity ──────────────────
+            # Detect if phase 2 has broken connectivity 
             # outlet — a gradient step in phase 2 removed a critical cell.
             # Switch to reconnection mode temporarily without resetting latch.
 
@@ -306,11 +274,11 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
 
             else:
                 _vol_hi = 0.2
-                # ── Volume range penalty (two-sided) ──────────────────────────
+                # Volume range penalty (two-sided)
                 vol_below         = torch.clamp(vol_lo - vol, min=0.0)
                 vol_above         = torch.clamp(vol - _vol_hi, min=0.0)
                 vol_range_penalty = vol_below**2 + vol_above**2
-                vol_in_range      = (vol_val >= vol_lo) and (vol_val <= vol_hi)
+                vol_in_range      = (vol_val >= vol_lo) and (vol_val <= _vol_hi)
 
                 # Normal phase 2 — connected, optimize dp + volume.
                 loss = (
@@ -321,34 +289,33 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
                 )
                 phase_str = "PHASE2:dp+vol"
 
-        # ── Gradient step ──────────────────────────────────────────────
+        # Gradient step 
         loss.backward()
         torch.nn.utils.clip_grad_norm_([z], max_norm=1.0)
         optimizer.step()
         scheduler.step()
         z.data.clamp_(-3.0, 3.0)
 
-        # save best deisng if connected in phase 2
-        if conn_penalty == 0.0 and phase_str.startswith("PHASE2") and dp_val < best_dp:
-            best_dp  = dp_val
-            best_z   = z.detach().clone()
-            best_vol = vol_val
 
-            with torch.no_grad():
-                design_np = (torch.sigmoid(
-                    vae.decode(best_z, bc_mask_tensor)[0, 0]
-                ) > THRESHOLD).float().cpu().numpy()
+        new_dp  = dp_val
+        new_z   = z.detach().clone()
+        new_vol = vol_val
 
-            plot_design(
-                design_np, ports, best_dp, best_vol, step,
-                title=f"[{run_id}] Step {step} | Phase2 best",
-                save_path=os.path.join(
-                    intermediate_dir,
-                    f"{run_id}_step{step:04d}_dp{best_dp:.4f}.png"
-                )
+        with torch.no_grad():
+            design_np = (torch.sigmoid(
+                vae.decode(new_z, bc_mask_tensor)[0, 0]
+            ) > THRESHOLD).float().cpu().numpy()
+
+        plot_design(
+            design_np, ports, new_dp, new_vol, step,
+            title=f"[{run_id}] Step {step} | Phase2 best",
+            save_path=os.path.join(
+                intermediate_dir,
+                f"{run_id}_step{step:04d}_dp{new_dp:.4f}.png"
             )
+        )
 
-        # ── Logging ────────────────────────────────────────────────────
+        # debug
         vol_str = f"{'OK' if vol_in_range else 'OOB'}"
         print(f"  [{run_id}] step {step:03d} | {phase_str} | "
               f"T={temperature:.3f} | dp={dp_val:.5f} | "
@@ -366,26 +333,18 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
             'temperature':  temperature,
         })
 
-    # If phase 2 was never reached, return final z with a warning
-    if best_dp == float('inf'):
-        best_z   = z.detach().clone()
-        best_dp  = dp_val
-        best_vol = vol_val
-        print(f"  [{run_id}] WARNING: never connected — returning final z")
-
     return {
-        'best_z':          best_z.squeeze(0).cpu().numpy(),
-        'best_dp':         best_dp,
-        'best_vol':        best_vol,
+        'best_z':          new_z.squeeze(0).cpu().numpy(),
+        'best_dp':         new_dp,
+        'best_vol':        new_vol,
         'history':         history,
         'run_id':          run_id,
         'phase_reached':   2 if phase_connected else 1,
     }
 
 
-# =========================================================
 # FINAL LBM EVALUATION ON HARD BINARY
-# =========================================================
+
 def evaluate_binary(vae, bc_mask_tensor, masks, ports, z_np):
     """
     Decode z, threshold to binary, verify connectivity,
@@ -429,9 +388,9 @@ def evaluate_binary(vae, bc_mask_tensor, masks, ports, z_np):
     return dp.item(), vol, True, design_np, "OK"
 
 
-# =========================================================
+
 # MAIN OPTIMIZER WITH MULTIPLE RESTARTS
-# =========================================================
+
 def run_latent_grad(ports,
                     vae_path      = "vae_best_new.pth",
                     n_restarts    = 5,
@@ -441,15 +400,7 @@ def run_latent_grad(ports,
                     lambda_binary = 2.0,
                     temp_start    = 1.0,
                     temp_end      = 0.1):
-    """
-    Main entry point. Runs n_restarts independent gradient trajectories
-    from different random z initializations, returns best result.
 
-    Multiple restarts are necessary because:
-    - Gradient descent is local — different starts find different basins
-    - The latent space has multiple topology families
-    - Temperature annealing can get stuck in local minima
-    """
     print(f"\nLatent Gradient Optimizer")
     print(f"  Device:        {DEVICE}")
     print(f"  Ports:         {ports_to_desc(ports)}")
@@ -466,7 +417,7 @@ def run_latent_grad(ports,
     intermediate_dir = f"./latgrad_intermediates/{run_tag}"
     os.makedirs(intermediate_dir, exist_ok=True)
 
-    # ── Load VAE ──────────────────────────────────────────────────────
+    # Load VAE 
     vae = FluidVAE(latent_dim=LATENT_DIM).to(DEVICE)
     vae.load_state_dict(
         torch.load(vae_path, map_location=DEVICE, weights_only=True))
@@ -476,16 +427,16 @@ def run_latent_grad(ports,
     for param in vae.parameters():
         param.requires_grad_(False)
 
-    # ── BC setup ──────────────────────────────────────────────────────
+    # BC setup 
     bc_mask_np     = make_bc_mask(ports)
     bc_mask_tensor = torch.FloatTensor(bc_mask_np).unsqueeze(0).to(DEVICE)
     masks          = build_bc_masks(Nx, Ny, WALL, ports)
 
-    # ── Run restarts ──────────────────────────────────────────────────
+    # Run restarts 
     restart_results = []
 
     for restart in range(n_restarts):
-        print(f"\n── Restart {restart+1}/{n_restarts} ──────────────────────────")
+        print(f"\nRestart {restart+1}/{n_restarts}")
 
         # Each restart uses a different random z initialization
         # Initialization strategy:
@@ -538,7 +489,7 @@ def run_latent_grad(ports,
 
         restart_results.append(result)
 
-    # ── Select best across restarts ───────────────────────────────────
+    # Select best across restarts 
     feasible = [r for r in restart_results if r['connected']]
 
     if not feasible:
@@ -555,7 +506,7 @@ def run_latent_grad(ports,
     print(f"Soft dp was: {best['best_dp']:.5f} | "
           f"Gap: {best['dp_binary'] - best['best_dp']:+.5f}")
 
-    # ── Save outputs ──────────────────────────────────────────────────
+    # Save outputs 
 
     # Final topology plot
     plot_path = f"latgrad_{run_tag}.png"
@@ -622,10 +573,10 @@ def run_latent_grad(ports,
     print(f"Saved: {conv_path}")
 
     # Summary table across all restarts
-    print(f"\n{'─'*70}")
+
     print(f"{'Restart':<10} {'Best soft dp':<15} {'Binary dp':<12} "
           f"{'Vol':<8} {'Connected'}")
-    print(f"{'─'*70}")
+    
     for r in restart_results:
         dp_b = f"{r['dp_binary']:.5f}" if r['connected'] else "N/A"
         vol  = f"{r['vol_binary']:.3f}" if r['connected'] else "N/A"
@@ -633,14 +584,11 @@ def run_latent_grad(ports,
         best_mark = " ← best" if r == best else ""
         print(f"  {r['run_id']:<8} {r['best_dp']:<15.5f} {dp_b:<12} "
               f"{vol:<8} {mark}{best_mark}")
-    print(f"{'─'*70}")
+
 
     return best['best_z'], best['design_np'], best['dp_binary'], best['vol_binary']
 
 
-# =========================================================
-# ENTRY POINT
-# =========================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Latent gradient optimizer for fluid topology"
