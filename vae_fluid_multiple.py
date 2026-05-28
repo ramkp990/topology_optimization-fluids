@@ -331,6 +331,7 @@ def is_feasible_vae(density_np, ports,
 
 # MODEL
 
+
 class FluidVAE(nn.Module):
 
     def __init__(self, latent_dim=64):
@@ -415,6 +416,8 @@ class FluidVAE(nn.Module):
         z          = self.reparameterize(mu, logvar)
         recon      = self.decode(z, bc_mask)
         return recon, mu, logvar
+
+
 
 
 

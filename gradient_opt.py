@@ -9,6 +9,7 @@ from collections import deque
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from scipy.ndimage import binary_erosion
 
 from vae_fluid_multiple import FluidVAE, make_bc_mask, port_cells
 import new_generate_dataset_multiple as fds
@@ -169,7 +170,6 @@ def plot_design(design_np, ports, dp, vol, step,
     plt.close()
 
 
-# grad optimization step for single restart
 
 def optimize_single(vae, bc_mask_tensor, masks, ports,
                     z_init, lambda_volume,
@@ -198,10 +198,23 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
     best_dp  = float('inf')
     best_z   = z.detach().clone()
     best_vol = None
+    target_reached = False
+    target_vol = 0.2
     history  = []
 
     # Latch — never rolls back once True
     phase_connected = False
+    pahse_2_flag = 0
+
+    phase_3_initialized = False
+    phase_3_best_dp     = float('inf')
+    phase3_best_dp_vol = float('inf')
+    phase_3_no_improve  = 0
+    PHASE_3_PATIENCE    = 10    # exit if no improvement for this many steps
+    PHASE_3_LR_MULT    = 5.0   # aggressive lr multiplier for large jumps
+    PHASE_3_GRAD_CLIP  = 5.0   # relaxed from 1.0 — allow larger steps
+    lambda_vol_al  = 0.0   # Lagrange multiplier
+    rho_al         = 50.0  # penalty strength
 
     for step in range(n_steps):
 
@@ -213,7 +226,19 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
         # Forward pass
         logits       = vae.decode(z, bc_mask_tensor)
         soft_density = torch.sigmoid(logits[0, 0] / temperature)
-
+        design_check = (soft_density.detach() > THRESHOLD).cpu().numpy()
+        connected, reason = check_connectivity(design_check, ports)
+        skip_lbm = not connected
+        # if skip_lbm:
+        #     dp     = torch.tensor(0.0, device=device)  # no dp in loss
+        #     dp_val = 0.0
+        #     # density_clean still needed for vol/bin penalty
+        #     density_clean = torch.where(
+        #         masks["solid_mask"], torch.zeros_like(soft_density), soft_density)
+        #     density_clean = torch.where(
+        #         masks["fluid_mask"], torch.ones_like(density_clean), density_clean)
+        #     print(f"  [diag] Step {step:03d} | DISCONNECTED — reason: {reason} — skipping LBM")
+        # else:
         dp, density_clean = simulate_soft(soft_density, masks, ALPHA_MAX)
         dp_val  = dp.item()
         vol     = density_clean[is_designable].mean()
@@ -222,8 +247,12 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
         # Binary penalty
         bin_penalty = (density_clean * (1.0 - density_clean)).mean()
 
-        if step < n_steps // 3:
+        eroded =  binary_erosion(design_check, structure=np.ones((3,3)), iterations=2)
+        robust = check_connectivity(eroded, ports)[0]
 
+        #if not robust and pahse_2_flag == 0:
+        if step < 40: #n_steps // 3:
+            print(f"  [diag] Step {step:03d} | NOT ROBUST TO EROSION — applying strong connectivity penalty")
             with torch.no_grad():
                 design_np = (density_clean > THRESHOLD).cpu().numpy()
             
@@ -239,12 +268,15 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
             loss = (
                 20.0      * vol_floor_pen
                 + dp
+                + lambda_conn * conn_penalty
             )
 
             phase_str = "PHASE1:reduce_dp_and_connect"
 
     
-        else:
+        elif not target_reached:
+
+            pahse_2_flag = 1
             with torch.no_grad():
                 design_np = (density_clean > THRESHOLD).cpu().numpy()
             
@@ -266,14 +298,14 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
 
                 loss = (
                     lambda_conn * conn_penalty      # strong reconnection
-                    + 20.0      * vol_floor_pen     # add fluid back if needed
+                    + 50.0      * vol_floor_pen     # add fluid back if needed
                     + w_bin     * bin_penalty       # keep binary pressure
                     + dp
                 )
                 phase_str = "PHASE2:reconnect"
 
             else:
-                _vol_hi = 0.2
+                _vol_hi = 0.175
                 # Volume range penalty (two-sided)
                 vol_below         = torch.clamp(vol_lo - vol, min=0.0)
                 vol_above         = torch.clamp(vol - _vol_hi, min=0.0)
@@ -282,19 +314,157 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
 
                 # Normal phase 2 — connected, optimize dp + volume.
                 loss = (
-                    dp
-                    + lambda_volume * vol_range_penalty
+                    10 * dp
+                    + 100.0 * vol_range_penalty
                     + lambda_conn * conn_penalty   # slightly stronger maintenance
                     + w_bin * bin_penalty
                 )
                 phase_str = "PHASE2:dp+vol"
+            
+            if vol <= target_vol:
+                print(f" target volume reached at step {step}")
+                target_reached = True
+                
+        # when target_reached first becomes True — reinitialise optimizer
+        if target_reached and not phase_3_initialized:
+            phase_3_initialized = True
+            # instaed of best dp we track best dp with volume near target — only count improvement when vol is close enough to target
+            phase_3_best_dp     = dp_val
+            phase3_best_dp_vol = dp_val/vol_val
+            print(f"  [{run_id}] Initializing PHASE3 — target volume reached at step {step} with dp={dp_val:.5f} vol={vol_val:.3f} dp/vol={dp_val/vol_val:.3f}")
+            phase_3_no_improve  = 0
+            # replace optimizer with aggressive lr for large dp jumps
+            optimizer = torch.optim.Adam([z], lr=lr * PHASE_3_LR_MULT)
+            # short cosine schedule — hits minimum quickly
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=20, eta_min=lr * PHASE_3_LR_MULT * 0.1
+            )
+            print(f"  [{run_id}] Entering PHASE3 — lr={lr * PHASE_3_LR_MULT:.4f} | "
+                  f"dp at entry={dp_val:.5f}")
 
-        # Gradient step 
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_([z], max_norm=1.0)
-        optimizer.step()
-        scheduler.step()
-        z.data.clamp_(-3.0, 3.0)
+        # ── initialise phase 3 once ───────────────────────────────────────
+        if target_reached and not phase_3_initialized:
+            phase_3_initialized = True
+            phase_3_best_dp     = float('inf')
+            phase3_best_dp_vol  = float('inf')
+            phase_3_no_improve  = 0
+            optimizer = torch.optim.Adam([z], lr=lr * PHASE_3_LR_MULT)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=n_steps, eta_min=lr * PHASE_3_LR_MULT * 0.1
+            )
+            print(f"  [{run_id}] Entering PHASE3 — lr={lr*PHASE_3_LR_MULT:.4f} "
+                  f"| dp={dp_val:.5f} vol={vol_val:.3f}")
+
+        # ── phase 3 gradient step ─────────────────────────────────────────
+        _phase3_stepped = False
+        if target_reached:
+            _phase3_stepped = True   # always — avoids double backward
+
+            if conn_penalty == 1.0 or vol_val < target_vol - 0.02:
+                # volume collapsed — restore, no dp signal
+                optimizer.zero_grad()
+                vol_floor = torch.clamp(target_vol - vol + 0.02, min=0.0) ** 2
+                loss = 1000.0 * vol_floor + lambda_conn * 20.0 * conn_penalty
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_([z], max_norm=1.0)
+                optimizer.step()
+                phase_str = "PHASE3:restore_vol"
+
+            else:
+                # gradient projection — reduce dp, correct vol drift
+                optimizer.zero_grad()
+
+                loss_dp  = dp
+                loss_vol = (vol - target_vol) ** 2
+
+                loss_dp.backward(retain_graph=True)
+                g_dp = z.grad.clone()
+                z.grad.zero_()
+
+                loss_vol.backward()
+                g_vol = z.grad.clone()
+                z.grad.zero_()
+
+                dot      = (g_dp * g_vol).sum()
+                vol_norm = (g_vol * g_vol).sum().clamp(min=1e-8)
+                g_proj   = g_dp - (dot / vol_norm) * g_vol
+
+                # stronger vol correction — prevents upward drift
+                g_corrected = g_proj + 200.0 * g_vol * (vol_val - target_vol)
+
+                z.grad = g_corrected
+                torch.nn.utils.clip_grad_norm_([z], max_norm=PHASE_3_GRAD_CLIP)
+                optimizer.step()
+                phase_str = "PHASE3:projected_dp"
+
+            scheduler.step()
+            z.data.clamp_(-3.0, 3.0)
+
+            # ── best tracking — wider tolerance, pure dp metric ───────────
+            # VOL_TOL widened: soft vol and binary vol differ due to temperature
+            # gap; tracking only within 0.015 misses most improvements
+            VOL_TOL = 0.04
+            vol_ok  = abs(vol_val - target_vol) < VOL_TOL
+
+            if conn_penalty == 0.0:
+                if vol_ok and dp_val < phase_3_best_dp - 1e-5:
+                    phase_3_best_dp    = dp_val
+                    phase3_best_dp_vol = dp_val / vol_val
+                    phase_3_no_improve = 0
+                    best_z   = z.detach().clone()
+                    best_dp  = dp_val
+                    best_vol = vol_val
+                    print(f"  [{run_id}] Phase3 new best dp={dp_val:.5f} "
+                          f"vol={vol_val:.3f} at step {step}")
+                else:
+                    phase_3_no_improve += 1
+
+                if phase_3_no_improve >= PHASE_3_PATIENCE:
+                    print(f"  [{run_id}] Phase3 converged — {PHASE_3_PATIENCE} "
+                          f"steps no improvement | best dp={phase_3_best_dp:.5f}")
+                    break
+
+                # skip the generic gradient step below — phase 3 already stepped
+                # logging still happens after this
+                _phase3_stepped = True
+        else:
+            _phase3_stepped = False
+
+                # ── generic gradient step (phases 1 & 2 only) ────────────────────
+        if not _phase3_stepped:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_([z], max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+            z.data.clamp_(-3.0, 3.0)
+
+        # #  phase 3 early exit — stop when dp stops improving 
+        # if target_reached and conn_penalty == 0.0:
+        #     with torch.no_grad():
+        #         vol_violation_val = vol_val - target_vol
+        #         lambda_vol_al    += rho_al * vol_violation_val
+        #         # slowly tighten rho as optimization matures
+        #         if phase_3_no_improve % 5 == 0:
+        #             rho_al = min(rho_al * 1.2, 300.0)
+
+        # # fix best-tracking — only count improvement when vol is near target
+        # VOL_TOL = 0.015   # accept vol within ±0.015 of target
+
+        # if target_reached and conn_penalty == 0.0:
+        #     vol_ok = abs(vol_val - target_vol) < VOL_TOL
+        #     if vol_ok and dp_val/vol < phase3_best_dp_vol - 1e-5:
+        #     #if dp_val/vol_val < phase3_best_dp_vol - 1e-5:
+        #         phase3_best_dp_vol    = dp_val/vol_val
+        #         phase_3_no_improve = 0
+        #         phase_3_best_dp = dp_val
+        #         print(f"  [{run_id}] Phase3 new best dp={dp_val:.5f} vol={vol_val:.3f} dp/vol =  {phase3_best_dp_vol:.3f} at step {step}")
+        #     else:
+        #         phase_3_no_improve += 1
+
+        #     if phase_3_no_improve >= PHASE_3_PATIENCE:
+        #         print(f"  [{run_id}] Phase3 converged — no improvement in "
+        #               f"{PHASE_3_PATIENCE} steps | final dp={phase_3_best_dp:.5f}")
+        #         break
 
 
         new_dp  = dp_val
@@ -320,6 +490,7 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
         print(f"  [{run_id}] step {step:03d} | {phase_str} | "
               f"T={temperature:.3f} | dp={dp_val:.5f} | "
               f"vol={vol_val:.3f}({vol_str}) | "
+              f"dp/vol={dp_val/vol_val:.3f} | "
               f"conn={conn_penalty:.3f} | loss={loss.item():.5f}")
 
         history.append({
@@ -333,14 +504,27 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
             'temperature':  temperature,
         })
 
+    # return best recorded z, not just last step
+    final_z   = best_z if best_vol is not None else new_z
+    final_dp  = best_dp if best_vol is not None else new_dp
+    final_vol = best_vol if best_vol is not None else new_vol
+
     return {
-        'best_z':          new_z.squeeze(0).cpu().numpy(),
-        'best_dp':         new_dp,
-        'best_vol':        new_vol,
-        'history':         history,
-        'run_id':          run_id,
-        'phase_reached':   2 if phase_connected else 1,
+        'best_z':        final_z.squeeze(0).cpu().numpy(),
+        'best_dp':       final_dp,
+        'best_vol':      final_vol,
+        'history':       history,
+        'run_id':        run_id,
+        'phase_reached': 2 if phase_connected else 1,
     }
+    # return {
+    #     'best_z':          new_z.squeeze(0).cpu().numpy(),
+    #     'best_dp':         new_dp,
+    #     'best_vol':        new_vol,
+    #     'history':         history,
+    #     'run_id':          run_id,
+    #     'phase_reached':   2 if phase_connected else 1,
+    # }
 
 
 # FINAL LBM EVALUATION ON HARD BINARY
@@ -411,7 +595,6 @@ def run_latent_grad(ports,
     print(f"  lambda_volume: {lambda_volume}")
     print(f"  lambda_binary: {lambda_binary}")
     print(f"  temperature:   {temp_start} → {temp_end}")
-    print("=" * 70)
 
     run_tag          = ports_to_tag(ports) + f"_lv{lambda_volume}"
     intermediate_dir = f"./latgrad_intermediates/{run_tag}"
@@ -445,6 +628,7 @@ def run_latent_grad(ports,
         #   restart 2+: z ~ N(0, 0.5)  (tighter sampling, explore near-prior)
         if restart == 0:
             z_init = torch.zeros(1, LATENT_DIM)
+            #z_init = (torch.randn(1, LATENT_DIM) * 0.5).clamp(-3, 3)
         elif restart == 1:
             z_init = torch.randn(1, LATENT_DIM).clamp(-3, 3)
         else:
@@ -458,7 +642,7 @@ def run_latent_grad(ports,
             masks          = masks,
             ports          = ports,
             z_init         = z_init,
-            lambda_volume  = 50,
+            lambda_volume  = 100,
             n_steps        = n_steps,
             lr             = lr,
             temp_start     = 1,
@@ -500,7 +684,6 @@ def run_latent_grad(ports,
     # Best = lowest dp on binary evaluation
     best = min(feasible, key=lambda r: r['dp_binary'])
 
-    print(f"\n{'='*70}")
     print(f"Best result: restart={best['run_id']} | "
           f"dp={best['dp_binary']:.5f} | vol={best['vol_binary']:.3f}")
     print(f"Soft dp was: {best['best_dp']:.5f} | "
@@ -637,7 +820,7 @@ if __name__ == "__main__":
                 "center": center,
             })
 
-    run_latent_grad(
+    best_z, best_design_np, best_design_bin, best_vol =run_latent_grad(
         ports          = ports,
         vae_path       = args.vae_path,
         n_restarts     = args.n_restarts,
