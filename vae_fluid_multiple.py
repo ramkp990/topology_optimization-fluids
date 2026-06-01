@@ -332,7 +332,7 @@ def is_feasible_vae(density_np, ports,
 # MODEL
 
 
-class FluidVAE(nn.Module):
+class FluidVAE1(nn.Module):
 
     def __init__(self, latent_dim=64):
         super().__init__()
@@ -417,10 +417,181 @@ class FluidVAE(nn.Module):
         recon      = self.decode(z, bc_mask)
         return recon, mu, logvar
 
+class BCEncoder(nn.Module):
+    """Returns bottleneck (flattened, 2048-dim, unchanged) PLUS intermediate
+    feature maps for U-Net skips into the decoder."""
+    def __init__(self):
+        super().__init__()
+        self.c1 = nn.Sequential(nn.Conv2d(2,  16, 3, 2, 1), nn.LeakyReLU(0.2))  # 16x32x32
+        self.c2 = nn.Sequential(nn.Conv2d(16, 32, 3, 2, 1), nn.LeakyReLU(0.2))  # 32x16x16
+        self.c3 = nn.Sequential(nn.Conv2d(32, 64, 3, 2, 1), nn.LeakyReLU(0.2))  # 64x8x8
+        self.c4 = nn.Sequential(nn.Conv2d(64, 128,3, 2, 1), nn.LeakyReLU(0.2))  # 128x4x4
+
+    def forward(self, bc):
+        f1 = self.c1(bc)   # 32x32   skip
+        f2 = self.c2(f1)   # 16x16   skip
+        f3 = self.c3(f2)   #  8x8    skip
+        f4 = self.c4(f3)   #  4x4    bottleneck
+        return f4, f3, f2, f1
+
+
+def up_block(in_ch, out_ch):
+    """Sharp upsampling: nearest-neighbor resize then conv (no checkerboard)."""
+    return nn.Sequential(
+        nn.Upsample(scale_factor=2, mode='nearest'),
+        nn.Conv2d(in_ch, out_ch, 3, 1, 1),
+        nn.LeakyReLU(0.2),
+    )
+
+class FluidVAE(nn.Module):
+
+    def __init__(self, latent_dim=64):
+        super().__init__()
+        self.latent_dim = latent_dim
+        conv_flat       = 256 * 4 * 4
+
+        # Encoder: density[1] + bc_mask[2] = 3 channels
+        self.enc_conv = nn.Sequential(
+            nn.Conv2d(3,   32,  4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.1), 
+            nn.Conv2d(32,  64,  4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(64,  128, 4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(128, 256, 4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Flatten()
+        )
+
+        self.fc_mu     = nn.Linear(conv_flat, latent_dim)
+        self.fc_logvar = nn.Linear(conv_flat, latent_dim)
+        '''
+        # Separate BC encoder on decoder side
+        self.bc_enc = nn.Sequential(
+            nn.Conv2d(2,  32, 4, stride=2, padding=1), nn.LeakyReLU(0.2),
+            nn.Conv2d(32, 64, 4, stride=2, padding=1), nn.LeakyReLU(0.2),
+            nn.Conv2d(64,128, 4, stride=2, padding=1), nn.LeakyReLU(0.2),
+            nn.Flatten(),
+            nn.Linear(128 * 8 * 8, 128),   # 🔑 BOTTLENECK: 2048 → 128
+            nn.LeakyReLU(0.2)
+        )
+        mask_feat_dim = 128  # ← New dimension for BC features after bottleneck
+        '''
+        self.bc_enc = nn.Sequential(
+            nn.Conv2d(2,  16,  4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(16, 32,  4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(32, 64,  4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(64, 128, 4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Flatten()
+        )
+        bc_flat = 128 * 4 * 4
+
+        
+        # Decoder
+        self.dec_fc = nn.Linear(latent_dim + bc_flat, conv_flat)
+        #self.dec_fc = nn.Linear(latent_dim + mask_feat_dim, 256 * 4 * 4)
+        self.dec_conv = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.ConvTranspose2d(128, 64,  4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.ConvTranspose2d(64,  32,  4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.1), 
+            nn.ConvTranspose2d(32,  1,   4, stride=2, padding=1),
+            #nn.Sigmoid()
+        )
+
+    def encode(self, x, bc_mask):
+        inp = torch.cat([x, bc_mask], dim=1)
+        h   = self.enc_conv(inp)
+        return self.fc_mu(h), self.fc_logvar(h)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        return mu + std * torch.randn_like(std)
+
+    def decode(self, z, bc_mask):
+        bc_feat = self.bc_enc(bc_mask)
+        h       = self.dec_fc(torch.cat([z, bc_feat], dim=1))
+        h       = h.view(-1, 256, 4, 4)
+        return self.dec_conv(h)
+
+    def forward(self, x, bc_mask):
+        mu, logvar = self.encode(x, bc_mask)
+        z          = self.reparameterize(mu, logvar)
+        recon      = self.decode(z, bc_mask)
+        return recon, mu, logvar
 
 
 
+class FluidVAE1(nn.Module):
+    def __init__(self, latent_dim=64):
+        super().__init__()
+        self.latent_dim = latent_dim
+        conv_flat = 256 * 4 * 4
 
+        # --- Encoder (density[1] + bc[2] = 3 ch) — unchanged, dropout kept ---
+        self.enc_conv = nn.Sequential(
+            nn.Conv2d(3,   32,  4, 2, 1), nn.LeakyReLU(0.2), nn.Dropout2d(0.1),
+            nn.Conv2d(32,  64,  4, 2, 1), nn.LeakyReLU(0.2),
+            nn.Conv2d(64,  128, 4, 2, 1), nn.LeakyReLU(0.2),
+            nn.Conv2d(128, 256, 4, 2, 1), nn.LeakyReLU(0.2),
+            nn.Flatten(),
+        )
+        self.fc_mu     = nn.Linear(conv_flat, latent_dim)
+        self.fc_logvar = nn.Linear(conv_flat, latent_dim)
+
+        # --- BC encoder with skips (bottleneck still 128*4*4 = 2048) ---
+        self.bc_enc = BCEncoder()
+        bc_flat = 128 * 4 * 4
+
+        # --- Decoder bottleneck: cat(z, bc_bottleneck) — strong BC pathway kept ---
+        self.dec_fc = nn.Linear(latent_dim + bc_flat, conv_flat)
+
+        # --- Upsampling decoder with BC skips concatenated at each scale ---
+        self.up1 = up_block(256,        128)            # 4->8
+        self.rd1 = nn.Sequential(nn.Conv2d(128 + 64, 128, 3, 1, 1), nn.LeakyReLU(0.2))
+        self.up2 = up_block(128,        64)             # 8->16
+        self.rd2 = nn.Sequential(nn.Conv2d(64 + 32, 64, 3, 1, 1),  nn.LeakyReLU(0.2))
+        self.up3 = up_block(64,         32)             # 16->32
+        self.rd3 = nn.Sequential(nn.Conv2d(32 + 16, 32, 3, 1, 1),  nn.LeakyReLU(0.2))
+        self.up4 = up_block(32,         16)             # 32->64
+
+        # --- Full-resolution refinement (fixes corners / uniform width) ---
+        self.refine = nn.Sequential(
+            nn.Conv2d(16, 16, 3, 1, 1), nn.LeakyReLU(0.2),
+            nn.Conv2d(16, 1,  3, 1, 1),          # logits, no sigmoid (BCEWithLogits)
+        )
+
+    def encode(self, x, bc_mask):
+        h = self.enc_conv(torch.cat([x, bc_mask], dim=1))
+        return self.fc_mu(h), self.fc_logvar(h)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        return mu + std * torch.randn_like(std)
+
+    def decode(self, z, bc_mask):
+        f4, f3, f2, f1 = self.bc_enc(bc_mask)
+        h = self.dec_fc(torch.cat([z, f4.flatten(1)], dim=1)).view(-1, 256, 4, 4)
+
+        h = self.up1(h); h = self.rd1(torch.cat([h, f3], dim=1))   # 8x8  + BC skip
+        h = self.up2(h); h = self.rd2(torch.cat([h, f2], dim=1))   # 16   + BC skip
+        h = self.up3(h); h = self.rd3(torch.cat([h, f1], dim=1))   # 32   + BC skip
+        h = self.up4(h)                                            # 64
+        return self.refine(h)                                      # [-1,1,64,64] logits
+
+    def forward(self, x, bc_mask):
+        mu, logvar = self.encode(x, bc_mask)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z, bc_mask), mu, logvar
+    
 # LOSS
 
 def binary_penalty(rho):

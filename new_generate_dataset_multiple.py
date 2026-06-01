@@ -27,7 +27,7 @@ timesteps_grad    = 300
 tau   = 0.6
 omega = 1.0 / tau
 target_volume = 0.2
-REMOVAL_FRACTION = 0.1
+REMOVAL_FRACTION = 0.15
 
 topology = None
 

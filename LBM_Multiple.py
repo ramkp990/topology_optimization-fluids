@@ -455,7 +455,7 @@ def save_design_png(topo_tensor, dp_val, filename="results/best_design.png",
     plt.close()
     print(f"  Image saved → {filename}")
 
-
+'''
 # =========================================================
 # MAIN ESO LOOP
 # =========================================================
@@ -531,7 +531,7 @@ def main():
         elapsed = time.time() - start_time
         print(
             f"iter {it:03d} | Δp={dp_val:.6f} | "
-            f"vol={topology.mean().item():.3f} | "
+            f"vol={topology.mean().item():.3f} | " f"designable vol={current_vol:.3f} | "
             f"removed={n_remove} | time={elapsed:.1f}s"
         )
 
@@ -579,6 +579,140 @@ def main():
 
     return final_topology, final_vol, final_dp
 
+'''
+
+def main():
+    global topology   # simulate() reads the module-global `topology`
+    alpha_max_constant = 100.0
+    n_iterations = 100
+    dp_history = []
+
+    # Track the best feasible (vol <= target) snapshot so the reported design
+    # and its dp always correspond to the SAME topology.
+    best_feasible_topo = None
+    best_feasible_dp   = None
+    best_feasible_vol  = None
+
+    for it in range(n_iterations):
+        start_time = time.time()
+
+        if topology.grad is not None:
+            topology.grad.zero_()
+
+        pressure_drop = simulate(alpha_max_constant)
+        pressure_drop.backward()
+
+        dp_val = pressure_drop.item()
+        dp_history.append(dp_val)
+
+        with torch.no_grad():
+            is_designable = ~solid_mask & ~fluid_mask & ~orifice_mask
+            current_vol   = topology[is_designable].mean().item()
+
+            # ---- this dp_val belongs to the CURRENT topology (before removal).
+            #      if current topology is already at/below target, it's a valid
+            #      feasible snapshot whose dp and topology match exactly. ----
+            if current_vol <= target_volume:
+                best_feasible_topo = topology.detach().clone()
+                best_feasible_dp   = dp_val
+                best_feasible_vol  = current_vol
+                print(f"iter {it:03d} | Δp={dp_val:.6f} | "
+                      f"designable vol={current_vol:.3f} | "
+                      f"Target volume reached. Stopping.")
+                break
+
+            dL_dgamma     = topology.grad
+
+            is_fluid      = (topology > 0.5)
+            eligible_mask = is_fluid & is_designable & ~fluid_dilated
+            eligible_sens = dL_dgamma[eligible_mask]
+
+            n_fluid_cells  = is_fluid[is_designable].sum().item()
+            n_target_cells = int(target_volume * is_designable.sum().item())
+            n_remove = max(int((n_fluid_cells - n_target_cells) * REMOVAL_FRACTION), 1)
+            n_remove = min(n_remove, eligible_sens.numel())
+            _, idx = torch.topk(eligible_sens, n_remove, largest=True)
+
+            removal_mask  = torch.zeros_like(topology, dtype=torch.bool)
+            eligible_flat = torch.where(eligible_mask.flatten())[0]
+            removal_mask.flatten()[eligible_flat[idx]] = True
+
+            # -------------------------------------------------
+            # GENERIC outlet sealing protection (all walls)
+            # -------------------------------------------------
+            sealed = False
+            for p in outlet_ports:
+                r = p["range"]
+                wall = p["wall"]
+                if wall == "left":
+                    guard = removal_mask[0:WALL_THICKNESS+1, r]
+                elif wall == "right":
+                    guard = removal_mask[Nx-WALL_THICKNESS-1:Nx, r]
+                elif wall == "bottom":
+                    guard = removal_mask[r, 0:WALL_THICKNESS+1]
+                elif wall == "top":
+                    guard = removal_mask[r, Ny-WALL_THICKNESS-1:Ny]
+
+                if guard.all():
+                    print(f"iter {it:03d} | WARNING: removal would seal an outlet — skipping.")
+                    sealed = True
+                    break
+
+            if not sealed:
+                topology[removal_mask] = 0.0
+
+        elapsed = time.time() - start_time
+        print(
+            f"iter {it:03d} | Δp={dp_val:.6f} | "
+            f"vol={topology.mean().item():.3f} | "
+            f"designable vol={current_vol:.3f} | "
+            f"removed={n_remove} | time={elapsed:.1f}s"
+        )
+
+    # =========================================================
+    # SAVE — report dp of the EXACT topology being saved.
+    #
+    # Off-by-one bug (now fixed): previously `final_dp = dp_history[-1]`
+    # was the dp of the topology BEFORE the last removal, but
+    # `final_topology` was the topology AFTER it. They didn't match,
+    # which biased ESO's reported dp LOW. We now re-simulate on the
+    # exact saved topology so dp and design correspond.
+    # =========================================================
+    final_topology = topology.detach().clone()
+
+    # If the loop hit the target and stored a matched feasible snapshot,
+    # prefer that (its dp and topology already correspond). Otherwise the
+    # loop ran all n_iterations without reaching target — re-simulate the
+    # final topology so its dp is correct, not dp_history[-1].
+    if best_feasible_topo is not None:
+        final_topology = best_feasible_topo
+        final_dp       = best_feasible_dp
+        final_vol      = best_feasible_vol
+        print(f"\n[matched] Using feasible snapshot — "
+              f"dp and topology correspond exactly.")
+    else:
+        # ran out of iterations without hitting target volume:
+        # RE-SIMULATE on the saved topology so dp is not the off-by-one value.
+
+        topology = torch.nn.Parameter(final_topology.clone())
+        with torch.no_grad():
+            final_dp = simulate(alpha_max_constant).item()
+        is_designable = ~solid_mask & ~fluid_mask & ~orifice_mask
+        final_vol = final_topology[is_designable].mean().item()
+        print(f"\n[re-simulated] Target not reached in {n_iterations} iters — "
+              f"dp recomputed on final topology.")
+
+    print(f"Final Δp = {final_dp:.6f}")
+    print(f"Designable volume fraction = {final_vol:.3f} "
+          f"(target was {target_volume:.3f})")
+
+    save_design_png(
+        final_topology, final_dp,
+        "results/best_design.png",
+        current_vol=final_vol          # ← correct
+    )
+    if dp_history:
+        print(f"(Iter 0 Δp was {dp_history[0]:.6f} — full domain, not the design)")
 
 if __name__ == "__main__":
     main()
