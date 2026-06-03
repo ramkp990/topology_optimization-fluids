@@ -66,7 +66,7 @@ def run_lbm(ports, target_volume, lbm_config, output_dir):
     for p in ports:
         print(f"   {p['type']:6s} @ {p['wall']:6s}  center={p['center']}")
 
-    PORT_HEIGHT = 4   # must match lbm_multiple.py
+    PORT_HEIGHT = int(0.10 * Ny)
 
     cmd = [
         sys.executable, "lbm_multiple.py",
@@ -91,7 +91,7 @@ def run_lbm(ports, target_volume, lbm_config, output_dir):
     if not os.path.exists(lbm_out):
         print(f"[comparison] LBM ESO: expected output not found at {lbm_out}")
         return None
- 
+    '''
     arr = np.load(lbm_out).copy()
  
 
@@ -115,6 +115,16 @@ def run_lbm(ports, target_volume, lbm_config, output_dir):
     dst = os.path.join(output_dir, file_name)
     np.save(dst, arr)
     vol = float((arr > 0.5).mean())
+    print(f"[comparison] LBM ESO result saved → {dst}  shape={arr.shape}  vol={vol:.3f}")
+    return arr
+    '''
+    arr = np.load(lbm_out).copy()
+
+    file_name = f"lbm_final_np_{ports_to_tag(ports)}.npy"
+    dst = os.path.join(output_dir, file_name)
+    np.save(dst, arr)                          # save EXACTLY what ESO produced
+
+    vol = compute_vol(arr, ports)              # designable-only, matches latgrad
     print(f"[comparison] LBM ESO result saved → {dst}  shape={arr.shape}  vol={vol:.3f}")
     return arr
 

@@ -170,55 +170,6 @@ def plot_design(design_np, ports, dp, vol, step,
     plt.close()
 
 
-
-def optimize_single1(vae, bc_mask_tensor, masks, ports,
-                    z_init, lambda_volume,
-                    n_steps, lr,
-                    temp_start, temp_end,
-                    lambda_binary,
-                    lambda_conn,
-                    intermediate_dir, run_id,
-                    vol_lo=0.15, vol_hi=0.3,
-                    save_every=10):
-
-    device = DEVICE
-
-    is_designable = (
-        ~masks["solid_mask"] &
-        ~masks["fluid_mask"] &
-        ~masks["orifice_mask"]
-    )
-
-    z = torch.nn.Parameter(z_init.clone().to(device))
-    optimizer = torch.optim.Adam([z], lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=n_steps, eta_min=lr * 0.05
-    )
-
-    best_dp  = float('inf')
-    best_z   = z.detach().clone()
-    best_vol = None
-    target_reached = False
-    target_vol = 0.2
-    history  = []
-
-    # Latch — never rolls back once True
-    phase_connected = False
-    pahse_2_flag = 0
-
-    phase_3_initialized = False
-    phase_3_best_dp     = float('inf')
-    phase3_best_dp_vol = float('inf')
-    phase_3_no_improve  = 0
-    PHASE_3_PATIENCE    = 50    # exit if no improvement for this many steps
-    PHASE_3_LR_MULT    = 5.0   # aggressive lr multiplier for large jumps
-    PHASE_3_GRAD_CLIP  = 5.0   # relaxed from 1.0 — allow larger steps
-    lambda_vol_al  = 0.0   # Lagrange multiplier
-    rho_al         = 50.0  # penalty strength
-
-# add make_port_mask to this existing import:
-# from vae_fluid_multiple import FluidVAE, make_bc_mask, port_cells, make_port_mask
-
 def apply_physical_masks(soft_density, masks):
     """Solid -> 0, port/fluid -> 1, rest stays soft. Matches the density_clean
     construction inside simulate_soft, so volume measured here is consistent
@@ -258,7 +209,7 @@ def soft_connectivity_loss_single(prob, ports, device, n_iters=64, gain=3.0):
         inlet_losses.append(1.0 - reach)
     return torch.stack(inlet_losses).mean()
 
-import torch.nn.functional as F   # ensure available at module level
+import torch.nn.functional as F   
 
 
 def optimize_single(vae, bc_mask_tensor, masks, ports,
@@ -268,7 +219,7 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
                     lambda_binary,
                     lambda_conn,
                     intermediate_dir, run_id,
-                    vol_lo=0.20, vol_hi=0.21, save_every=10,
+                    vol_lo=0.195, vol_hi=0.205, save_every=10,
                     # ---- phase control ----
                     phase1_steps=40,
                     phase2_iters=30,
@@ -278,7 +229,7 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
                     # ---- volume penalties ----
                     w_vol_floor=40.0,
                     vol_growth_target=0.30,
-                    # ---- CONSTRICTION PENALTY (Fix 2) ----
+                    # ---- CONSTRICTION PENALTY ----
                     w_constrict=5.0,        # weight on width penalty
                     width_target=0.6,       # desired local fluid fraction (0..1)
                     constrict_kernel=5,     # neighborhood size for local-width measure
@@ -295,21 +246,7 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
                     grad_clip=5.0,
                     conn_iters=64,
                     plot_every=1):
-    """
-    Three-stage latent optimizer with constriction (width) penalty.
 
-    Constriction penalty (Fix 2): penalizes fluid cells sitting in thin
-    local neighborhoods. At fixed volume this drives material out of
-    over-wide channels and into narrow throats, pushing toward uniform
-    channel width and eliminating the junction-throat failure mode.
-
-    Phase 1   — GROW:    reach connected, build channels (dp + width shaping).
-    Phase 2A  — SQUEEZE: bring vol into band via gradient projection; the
-                          protected gradient is now ∇(dp + width), so the
-                          squeeze removes material without creating throats.
-    Phase 2B  — WALK:    large-step latent walk minimizing (dp + width),
-                          accepted only when feasible AND objective improves.
-    """
     device = DEVICE
 
     is_designable = (~masks["solid_mask"] &
@@ -342,16 +279,16 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
         optimizer, T_max=phase1_steps, eta_min=lr * 0.05)
 
     target_vol = (vol_lo + vol_hi) / 2.0
-    vol_tol    = (vol_hi - vol_lo) / 2.0 + 0.005
+    vol_tol    = (vol_hi - vol_lo) / 2.0 #+ 0.005
 
     # Trackers store the lowest-OBJECTIVE design, but keep its raw dp for output.
     best_obj, best_dp, best_z, best_vol = float('inf'), float('inf'), z.detach().clone(), None
     any_obj,  any_dp,  any_z,  any_vol  = float('inf'), float('inf'), z.detach().clone(), None
     history = []
 
-    # ============================================================
+
     # PHASE 1 — GROW (dp + width shaping)
-    # ============================================================
+
     for step in range(phase1_steps):
         optimizer.zero_grad()
 
@@ -435,13 +372,15 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
             'temperature': temperature,
         })
 
-    # ============================================================
+
     # PHASE 2A — SQUEEZE via gradient projection
     # The protected/combined gradient is now ∇(dp + width), so the squeeze
     # avoids creating throats while reducing volume.
-    # ============================================================
+
     best_obj, best_dp, best_z, best_vol = float('inf'), float('inf'), z.detach().clone(), None
     any_obj,  any_dp,  any_z,  any_vol  = float('inf'), float('inf'), z.detach().clone(), None
+    last2a_z, last2a_dp, last2a_vol = None, None, None
+    last2b_z, last2b_dp, last2b_vol = None, None, None
 
     squeeze_steps = 50
     squeeze_optimizer = torch.optim.Adam([z], lr=lr * 0.5)
@@ -518,6 +457,7 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
 
         in_band = vol_lo <= bin_vol <= vol_hi
         if connected and np.isfinite(dp_val) and in_band:
+            last2a_z, last2a_dp, last2a_vol = z.detach().clone(), dp_val, bin_vol
             if obj_val < any_obj:
                 any_obj, any_dp, any_z, any_vol = obj_val, dp_val, z.detach().clone(), bin_vol
             if obj_val < best_obj:
@@ -542,19 +482,13 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
             'vol_penalty': vol_penalty.item(),
         })
 
-    # ============================================================
+
     # PHASE 2B — gradient-guided latent WALK (minimize dp + width)
-    # ============================================================
+
     walk_temp = temp_end
 
     def full_evaluate(z_tensor, with_grad=False):
-        """
-        Decode -> mask -> LBM. Returns:
-          dp_t       (tensor/float or None if disconnected)
-          obj_t      combined objective dp/dp_ref + w_constrict*constrict
-                     (tensor if with_grad, else float; None if disconnected)
-          vol_t, bin_v, conn, density, soft
-        """
+
         if with_grad:
             z_tensor = z_tensor if z_tensor.requires_grad else \
                        z_tensor.clone().requires_grad_(True)
@@ -607,16 +541,7 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
         if not conn:
             break
 
-        # ---- 1. Gradient of OBJECTIVE (dp + width) at current z ----
-        # z_grad = z_curr.clone().detach().requires_grad_(True)
-        # dp_t, obj_t, vol_t, bin_v, conn, _, _ = full_evaluate(z_grad, with_grad=True)
-        # if not conn:
-        #     print(f"  [{run_id}] walk iter {walk_it} | current z disconnected — perturbing")
-        #     g_norm = None
-        # else:
-        #     obj_t.backward()
-        #     g = z_grad.grad.detach().clone()
-        #     g_norm = g / (g.norm() + 1e-8)
+
         # ---- 1. VOLUME-PRESERVING objective gradient at current z ----
         z_grad = z_curr.clone().detach().requires_grad_(True)
         logits  = vae.decode(z_grad, bc_mask_tensor)
@@ -714,6 +639,12 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
                     break
             alpha = max(alpha * alpha_shrink, alpha_min)
 
+        # record last ACCEPTED state in 2B
+        if accepted:
+            last2b_z   = z_curr.detach().clone()
+            last2b_dp  = dp_curr
+            last2b_vol = bin_v
+
         # ---- Logging + plotting ----
         with torch.no_grad():
             _, _, vol_t, bin_v, conn, _, _ = full_evaluate(z_curr, with_grad=False)
@@ -746,18 +677,24 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
             'n_backtracks': len(attempted), 'temperature': walk_temp,
         })
 
-    # ============================================================
-    # Return best
-    # ============================================================
-    if best_vol is not None:
+
+    if last2b_z is not None:
+        final_z, final_dp, final_vol = last2b_z, last2b_dp, last2b_vol
+        print(f"  [{run_id}] returning LAST-ACCEPTED from PHASE 2B "
+              f"(dp={final_dp:.5f}, vol={final_vol:.3f})")
+    elif last2a_z is not None:
+        final_z, final_dp, final_vol = last2a_z, last2a_dp, last2a_vol
+        print(f"  [{run_id}] no 2B acceptance; returning LAST in-band from PHASE 2A "
+              f"(dp={final_dp:.5f}, vol={final_vol:.3f})")
+    elif best_vol is not None:
         final_z, final_dp, final_vol = best_z, best_dp, best_vol
+        print(f"  [{run_id}] fallback: best-objective in-band design.")
     elif any_vol is not None:
-        print(f"  [{run_id}] WARNING: never held vol in [{vol_lo:.2f}, {vol_hi:.2f}]; "
-              f"returning lowest-obj connected design (vol={any_vol:.3f}).")
         final_z, final_dp, final_vol = any_z, any_dp, any_vol
+        print(f"  [{run_id}] WARNING: never held vol in band; lowest-obj connected.")
     else:
-        print(f"  [{run_id}] WARNING: never connected; returning last z.")
         final_z, final_dp, final_vol = z.detach().clone(), float('nan'), None
+        print(f"  [{run_id}] WARNING: never connected; returning last z.")
 
     return {
         'best_z':  final_z.squeeze(0).cpu().numpy(),
@@ -767,6 +704,7 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
         'run_id':  run_id,
         'phase_reached': 2,
     }
+
 
 
 def evaluate_binary(vae, bc_mask_tensor, masks, ports, z_np):
