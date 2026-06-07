@@ -1,9 +1,14 @@
 
 import argparse
-import os
+import os, torch, numpy as np, random
+_seed = int(os.environ.get("SWEEP_SEED", "0"))
+torch.manual_seed(_seed)
+np.random.seed(_seed)
+random.seed(_seed)
+#import os
 import json
-import numpy as np
-import torch
+#import numpy as np
+#import torch
 import torch.nn.functional as F
 from collections import deque
 import matplotlib
