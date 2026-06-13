@@ -162,7 +162,7 @@ def run_gradient_opt(ports, vae_path, n_restarts, n_steps, lr,
     print(f"[comparison] Latent Gradient result saved → {dst}  shape={arr.shape}")
     return arr
 
-
+'''
 def run_cmaes(ports, vae_path, lambda_volume, max_gen, popsize, sigma0,
               output_dir):
     cmd = [sys.executable, "cmaes_mit_data_multiple.py"]
@@ -182,6 +182,57 @@ def run_cmaes(ports, vae_path, lambda_volume, max_gen, popsize, sigma0,
     src  = f"cmaes_result_{tag}.npz"
     if not os.path.exists(src):
         print(f"[comparison] CMA-ES: expected output not found at {src}")
+        return None
+
+    data = np.load(src, allow_pickle=True)
+    arr  = data["best_design"]
+    file_name = f"cmaes_final_np_{tag}.npy"
+    dst  = os.path.join(output_dir, file_name)
+    np.save(dst, arr)
+    print(f"[comparison] CMA-ES result saved → {dst}  shape={arr.shape}")
+    return arr
+'''
+def run_cmaes(ports, vae_path, lambda_volume, max_gen, popsize, sigma0,
+              output_dir, base_seed=0, max_attempts=5):
+    tag = ports_to_tag(ports) + f"_lv{lambda_volume}"
+    src = f"cmaes_result_{tag}.npz"
+
+    for attempt in range(max_attempts):
+        # different seed each attempt, else seeded CMA-ES reproduces the same failure
+        attempt_seed = base_seed + attempt * 1000 + 777
+
+        # remove any stale result from a previous attempt so we don't
+        # mistake an old file for this attempt's success
+        if os.path.exists(src):
+            os.remove(src)
+
+        cmd = [sys.executable, "cmaes_mit_data_multiple.py"]
+        for p in ports:
+            cmd += ["--port", p["type"], p["wall"], str(p["center"])]
+        cmd += [
+            "--vae_path",      vae_path,
+            "--lambda_volume", str(lambda_volume),
+            "--max_gen",       str(max_gen),
+            "--popsize",       str(popsize),
+            "--sigma0",        str(sigma0),
+        ]
+
+        # pass the per-attempt seed via env (CMA-ES script reads SWEEP_SEED)
+        env = dict(os.environ, SWEEP_SEED=str(attempt_seed))
+
+        print(f"[comparison] CMA-ES attempt {attempt+1}/{max_attempts} "
+              f"(seed={attempt_seed})")
+        proc = subprocess.run(cmd, env=env)
+
+        if proc.returncode == 0 and os.path.exists(src):
+            print(f"[comparison] CMA-ES succeeded on attempt {attempt+1}")
+            break
+        else:
+            print(f"[comparison] CMA-ES attempt {attempt+1} failed "
+                  f"(rc={proc.returncode}, output_exists={os.path.exists(src)})")
+    else:
+        # for-else: ran all attempts without `break` → never succeeded
+        print(f"[comparison] CMA-ES: no feasible design after {max_attempts} attempts — skipping")
         return None
 
     data = np.load(src, allow_pickle=True)
@@ -325,7 +376,7 @@ def main():
 
     # ── Latent Gradient ───────────────────────────────────────────────────
     grad = parser.add_argument_group("Latent Gradient (gradient_opt_2.py)")
-    grad.add_argument("--n_restarts",         type=int,   default=1)
+    grad.add_argument("--n_restarts",         type=int,   default=5)
     grad.add_argument("--n_steps",            type=int,   default=200)
     grad.add_argument("--lr",                 type=float, default=0.05)
     grad.add_argument("--lambda_volume_grad", type=float, default=0.5,
@@ -338,9 +389,9 @@ def main():
 
     # ── CMA-ES ────────────────────────────────────────────────────────────
     cma = parser.add_argument_group("CMA-ES (cmaes_mit_data_multiple.py)")
-    cma.add_argument("--lambda_volume_cmaes", type=float, default=0.4,
+    cma.add_argument("--lambda_volume_cmaes", type=float, default=0.25,
                      help="lambda_volume passed to cmaes_mit_data_multiple.py")
-    cma.add_argument("--max_gen",  type=int,   default=50)
+    cma.add_argument("--max_gen",  type=int,   default=20)
     cma.add_argument("--popsize",  type=int,   default=24)
     cma.add_argument("--sigma0",   type=float, default=0.5)
     cma.add_argument("--skip_cmaes", action="store_true",

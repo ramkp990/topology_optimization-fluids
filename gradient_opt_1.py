@@ -19,6 +19,8 @@ from scipy.ndimage import binary_erosion
 from vae_fluid_multiple import FluidVAE, make_bc_mask, port_cells, make_port_mask
 import new_generate_dataset_multiple as fds
 from new_generate_dataset_multiple import build_bc_masks, sample_ports
+import psutil, os
+_proc = psutil.Process(os.getpid())
 
 
 LATENT_DIM = 32
@@ -420,6 +422,7 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
             obj_val = dp_val / dp_ref + w_constrict * constrict_val
 
             # g_vol — from volume penalty
+            before = _proc.memory_info().rss
             vol_penalty.backward(retain_graph=True)
             g_vol = z.grad.clone()
             squeeze_optimizer.zero_grad()
@@ -428,6 +431,9 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
             quality.backward()
             g_q = z.grad.clone()
             squeeze_optimizer.zero_grad()
+            after = _proc.memory_info().rss
+            print(f"  [mem] 2A sq_step {sq_step} backward delta: "
+                  f"{(after-before)/1e6:+.1f} MB (RSS {after/1e6:.0f} MB)")
 
             # Projection: Adam descends along -g_vol.
             # If g_vol·g_q < 0, then -g_vol aligns with +g_q -> quality WORSENS.
@@ -476,6 +482,18 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
         print(f"  [{run_id}] sq_step {sq_step:03d} | PHASE2A:squeeze | {mode:9s} | "
               f"{proj_status:9s} | dp={dp_str} | constr={cn_str} | "
               f"vol(bin {bin_vol:.3f} {in_range_str}) | vol_pen={vol_penalty.item():.4f}")
+        #save plot
+        if (sq_step % plot_every == 0):
+            with torch.no_grad():
+                vis = (torch.sigmoid(vae.decode(z.detach(), bc_mask_tensor)[0, 0])
+                       > THRESHOLD).float().cpu().numpy()
+            plot_design(vis, ports,
+                        dp_val if np.isfinite(dp_val) else None, bin_vol,
+                        phase1_steps + sq_step,
+                        title=f"[{run_id}] step {phase1_steps + sq_step} | PHASE2A:squeeze | {mode}",
+                        save_path=os.path.join(intermediate_dir,
+                                               f"{run_id}_step{phase1_steps + sq_step:04d}.png"),
+                        extra_info=f"\n{proj_status}")
 
         history.append({
             'step': phase1_steps + sq_step, 'phase': '2A',
@@ -565,6 +583,7 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
             obj_t       = dp_t / dp_ref + w_constrict * constrict_t
 
             # g_obj — direction that changes the objective
+            before = _proc.memory_info().rss
             obj_t.backward(retain_graph=True)
             g_obj = z_grad.grad.clone()
             z_grad.grad.zero_()
@@ -572,6 +591,9 @@ def optimize_single(vae, bc_mask_tensor, masks, ports,
             # g_vol — direction that changes volume
             vol_t.backward()
             g_vol = z_grad.grad.clone()
+            after = _proc.memory_info().rss
+            print(f"  [mem] 2B walk {walk_it} backward delta: "
+                  f"{(after-before)/1e6:+.1f} MB (RSS {after/1e6:.0f} MB)")
 
             # Project g_obj onto the constant-volume manifold:
             #   g_walk = g_obj - (g_obj·g_vol / |g_vol|²) g_vol
@@ -809,8 +831,8 @@ def run_latent_grad(ports,
         #   restart 1: z ~ N(0,1)  (random sample from prior)
         #   restart 2+: z ~ N(0, 0.5)  (tighter sampling, explore near-prior)
         if restart == 0:
-            z_init = torch.zeros(1, LATENT_DIM)
-            #z_init = (torch.randn(1, LATENT_DIM) * 0.5).clamp(-3, 3)
+            #z_init = torch.zeros(1, LATENT_DIM)
+            z_init = torch.randn(1, LATENT_DIM).clamp(-3, 3)
         elif restart == 1:
             z_init = torch.randn(1, LATENT_DIM).clamp(-3, 3)
         else:

@@ -74,7 +74,7 @@ def resolve_columns(df):
 # (A) TABLE
 # ======================================================================
 def build_master_table(root, out_csv):
-    pattern = os.path.join(root, "sweep_results", "good", "2026*", "sweep_results.csv")
+    pattern = os.path.join(root, "sweep_results", "best", "2026*", "sweep_results.csv")
     csvs = sorted(glob.glob(pattern))
     if not csvs:
         print(f"[table] no CSVs matched: {pattern}")
@@ -224,9 +224,9 @@ def _tag_for_cfg(cfg_dir):
 
 def make_side_by_side(root, out_dir):
     os.makedirs(out_dir, exist_ok=True)
-    cfg_dirs = sorted(glob.glob(os.path.join(root, "sweep_results", "good", "2026*", "cfg*")))
+    cfg_dirs = sorted(glob.glob(os.path.join(root, "sweep_results", "best", "2026*", "cfg*")))
     if not cfg_dirs:
-        print(f"[plots] no cfg dirs matched: {os.path.join(root,'sweep_results','good','2026*','cfg*')}")
+        print(f"[plots] no cfg dirs matched: {os.path.join(root,'sweep_results', 'best','2026*','cfg*')}")
         return
 
     print(f"[plots] found {len(cfg_dirs)} cfg dir(s).")
@@ -274,7 +274,7 @@ def main():
     args = ap.parse_args()
 
     print("ASSUMED LAYOUT:")
-    print("  runs : sweep_results/good/2026*/")
+    print("  runs : sweep_results/best/2026*/")
     print("  csv  : <run>/sweep_results.csv")
     print("  cfgs : <run>/cfg*/{lbm_eso,latent_grad}/<design.npy or .png>")
     print(f"  PORT_HEIGHT={PORT_HEIGHT}, WALL={WALL}, grid={Nx}x{Ny}")
