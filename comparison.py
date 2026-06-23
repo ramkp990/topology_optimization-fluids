@@ -66,7 +66,7 @@ def run_lbm(ports, target_volume, lbm_config, output_dir):
     for p in ports:
         print(f"   {p['type']:6s} @ {p['wall']:6s}  center={p['center']}")
 
-    PORT_HEIGHT = 4   # must match lbm_multiple.py
+    PORT_HEIGHT = int(0.10 * Ny)
 
     cmd = [
         sys.executable, "lbm_multiple.py",
@@ -91,7 +91,7 @@ def run_lbm(ports, target_volume, lbm_config, output_dir):
     if not os.path.exists(lbm_out):
         print(f"[comparison] LBM ESO: expected output not found at {lbm_out}")
         return None
- 
+    '''
     arr = np.load(lbm_out).copy()
  
 
@@ -117,12 +117,22 @@ def run_lbm(ports, target_volume, lbm_config, output_dir):
     vol = float((arr > 0.5).mean())
     print(f"[comparison] LBM ESO result saved → {dst}  shape={arr.shape}  vol={vol:.3f}")
     return arr
+    '''
+    arr = np.load(lbm_out).copy()
+
+    file_name = f"lbm_final_np_{ports_to_tag(ports)}.npy"
+    dst = os.path.join(output_dir, file_name)
+    np.save(dst, arr)                          # save EXACTLY what ESO produced
+
+    vol = compute_vol(arr, ports)              # designable-only, matches latgrad
+    print(f"[comparison] LBM ESO result saved → {dst}  shape={arr.shape}  vol={vol:.3f}")
+    return arr
 
 
 def run_gradient_opt(ports, vae_path, n_restarts, n_steps, lr,
                      lambda_volume, lambda_binary, temp_start, temp_end,
                      output_dir):
-    cmd = [sys.executable, "gradient_opt.py"]
+    cmd = [sys.executable, "gradient_opt_3.py"]
     for p in ports:
         cmd += ["--port", p["type"], p["wall"], str(p["center"])]
     cmd += [
@@ -152,7 +162,7 @@ def run_gradient_opt(ports, vae_path, n_restarts, n_steps, lr,
     print(f"[comparison] Latent Gradient result saved → {dst}  shape={arr.shape}")
     return arr
 
-
+'''
 def run_cmaes(ports, vae_path, lambda_volume, max_gen, popsize, sigma0,
               output_dir):
     cmd = [sys.executable, "cmaes_mit_data_multiple.py"]
@@ -172,6 +182,57 @@ def run_cmaes(ports, vae_path, lambda_volume, max_gen, popsize, sigma0,
     src  = f"cmaes_result_{tag}.npz"
     if not os.path.exists(src):
         print(f"[comparison] CMA-ES: expected output not found at {src}")
+        return None
+
+    data = np.load(src, allow_pickle=True)
+    arr  = data["best_design"]
+    file_name = f"cmaes_final_np_{tag}.npy"
+    dst  = os.path.join(output_dir, file_name)
+    np.save(dst, arr)
+    print(f"[comparison] CMA-ES result saved → {dst}  shape={arr.shape}")
+    return arr
+'''
+def run_cmaes(ports, vae_path, lambda_volume, max_gen, popsize, sigma0,
+              output_dir, base_seed=0, max_attempts=1):
+    tag = ports_to_tag(ports) + f"_lv{lambda_volume}"
+    src = f"cmaes_result_{tag}.npz"
+
+    for attempt in range(max_attempts):
+        # different seed each attempt, else seeded CMA-ES reproduces the same failure
+        attempt_seed = base_seed + attempt * 1000 + 777
+
+        # remove any stale result from a previous attempt so we don't
+        # mistake an old file for this attempt's success
+        if os.path.exists(src):
+            os.remove(src)
+
+        cmd = [sys.executable, "cmaes_test.py"]
+        for p in ports:
+            cmd += ["--port", p["type"], p["wall"], str(p["center"])]
+        cmd += [
+            "--vae_path",      vae_path,
+            "--lambda_volume", str(lambda_volume),
+            "--max_gen",       str(max_gen),
+            "--popsize",       str(popsize),
+            "--sigma0",        str(sigma0),
+        ]
+
+        # pass the per-attempt seed via env (CMA-ES script reads SWEEP_SEED)
+        env = dict(os.environ, SWEEP_SEED=str(attempt_seed))
+
+        print(f"[comparison] CMA-ES attempt {attempt+1}/{max_attempts} "
+              f"(seed={attempt_seed})")
+        proc = subprocess.run(cmd, env=env)
+
+        if proc.returncode == 0 and os.path.exists(src):
+            print(f"[comparison] CMA-ES succeeded on attempt {attempt+1}")
+            break
+        else:
+            print(f"[comparison] CMA-ES attempt {attempt+1} failed "
+                  f"(rc={proc.returncode}, output_exists={os.path.exists(src)})")
+    else:
+        # for-else: ran all attempts without `break` → never succeeded
+        print(f"[comparison] CMA-ES: no feasible design after {max_attempts} attempts — skipping")
         return None
 
     data = np.load(src, allow_pickle=True)
@@ -218,6 +279,15 @@ def _draw_ports(ax, ports):
         elif wall == "top":
             ax.plot([r.start, r.stop], [Ny-1, Ny-1], color=color, linewidth=lw)
 
+from new_generate_dataset_multiple import build_bc_masks
+def compute_vol(arr, ports):
+    masks = build_bc_masks(Nx, Ny, WALL, ports)
+    is_designable = (
+        ~masks["solid_mask"] &
+        ~masks["fluid_mask"] &
+        ~masks["orifice_mask"]
+    ).cpu().numpy()
+    return float((arr > 0.5)[is_designable].mean())
 
 def save_comparison_plot(results, ports, output_dir, tag):
     valid = {name: arr for name, arr in results.items() if arr is not None}
@@ -240,6 +310,7 @@ def save_comparison_plot(results, ports, output_dir, tag):
         ax.imshow(binary.T, cmap="gray_r", origin="lower", vmin=0, vmax=1)
         _draw_ports(ax, ports)
         vol = binary.mean()
+        vol = compute_vol(binary, ports)
         ax.set_title(f"{labels.get(name, name)}\nvol={vol:.3f}", fontsize=10)
         ax.axis("off")
 
@@ -304,7 +375,7 @@ def main():
                      help="Skip the LBM ESO run entirely.")
 
     # ── Latent Gradient ───────────────────────────────────────────────────
-    grad = parser.add_argument_group("Latent Gradient (gradient_opt.py)")
+    grad = parser.add_argument_group("Latent Gradient (gradient_opt_2.py)")
     grad.add_argument("--n_restarts",         type=int,   default=1)
     grad.add_argument("--n_steps",            type=int,   default=200)
     grad.add_argument("--lr",                 type=float, default=0.05)
@@ -318,9 +389,9 @@ def main():
 
     # ── CMA-ES ────────────────────────────────────────────────────────────
     cma = parser.add_argument_group("CMA-ES (cmaes_mit_data_multiple.py)")
-    cma.add_argument("--lambda_volume_cmaes", type=float, default=0.4,
+    cma.add_argument("--lambda_volume_cmaes", type=float, default=1,
                      help="lambda_volume passed to cmaes_mit_data_multiple.py")
-    cma.add_argument("--max_gen",  type=int,   default=25)
+    cma.add_argument("--max_gen",  type=int,   default=40)
     cma.add_argument("--popsize",  type=int,   default=24)
     cma.add_argument("--sigma0",   type=float, default=0.5)
     cma.add_argument("--skip_cmaes", action="store_true",
@@ -396,6 +467,7 @@ def main():
             print(f"  {name:<{col_w}} {'FAILED':12} {'—':>8}")
         else:
             vol = float((arr > 0.5).mean())
+            vol = compute_vol(arr, ports)
             print(f"  {name:<{col_w}} {'OK':12} {vol:>8.3f}")
 
     print(f"\n  Output dir : {args.output_dir}/")
